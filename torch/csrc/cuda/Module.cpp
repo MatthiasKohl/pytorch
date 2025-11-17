@@ -567,10 +567,13 @@ PyObject* THCPModule_hostEmptyCache(PyObject* _unused, PyObject* noargs) {
   Py_RETURN_NONE;
 }
 
-PyObject* THCPModule_emptyCache(PyObject* _unused, PyObject* noargs) {
-  HANDLE_TH_ERRORS {
+PyObject* THCPModule_emptyCache(PyObject* _unused, PyObject* arg) {
+  HANDLE_TH_ERRORS
+  TORCH_CHECK(THPUtils_checkLong(arg), "invalid argument to empty_cache");
+  const auto device_index = THPUtils_unpackDeviceIndex(arg);
+  {
     pybind11::gil_scoped_release no_gil;
-    c10::cuda::CUDACachingAllocator::emptyCache();
+    c10::cuda::CUDACachingAllocator::emptyCache({0, device_index});
   }
   END_HANDLE_TH_ERRORS
   Py_RETURN_NONE;
@@ -2044,7 +2047,7 @@ static struct PyMethodDef _THCPModule_methods[] = {
      THCPModule_setMemoryFraction,
      METH_VARARGS,
      nullptr},
-    {"_cuda_emptyCache", THCPModule_emptyCache, METH_NOARGS, nullptr},
+    {"_cuda_emptyCache", THCPModule_emptyCache, METH_O, nullptr},
     {"_cuda_memoryStats", THCPModule_memoryStats, METH_O, nullptr},
     {"_cuda_resetAccumulatedMemoryStats",
      THCPModule_resetAccumulatedMemoryStats,

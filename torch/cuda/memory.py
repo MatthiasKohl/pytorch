@@ -265,7 +265,7 @@ def get_per_process_memory_fraction(device: "Device" = None) -> float:
     return torch._C._cuda_getMemoryFraction(device)
 
 
-def empty_cache() -> None:
+def empty_cache(pool_id: int = 0) -> None:
     r"""Release all unoccupied cached memory currently held by the caching
     allocator so that those can be used in other GPU application and visible in
     `nvidia-smi`.
@@ -277,7 +277,7 @@ def empty_cache() -> None:
         more details about GPU memory management.
     """
     if is_initialized():
-        torch._C._cuda_emptyCache()
+        torch._C._cuda_emptyCache(pool_id)
 
 
 def memory_stats(device: "Device" = None) -> dict[str, Any]:
