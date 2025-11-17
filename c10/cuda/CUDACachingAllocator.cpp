@@ -958,6 +958,10 @@ struct PrivatePool {
   // cudaMalloc_count drop to zero, we can delete this PrivatePool from
   // graph_pools.
   int cudaMalloc_count{0};
+  // Number of active blocks in this pool. When use_count and
+  // active_blocks_count drop to zero, we can release any remaining blocks
+  // from this pool in free_block.
+  int active_blocks_count{0};
   // Instead of maintaining private BlockPools here, I could stuff all blocks
   // (private or no) into the top-level large_blocks and small_blocks, and
   // distinguish private blocks by adding a "pool id" check above the stream
@@ -1642,6 +1646,9 @@ class DeviceCachingAllocator {
     // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores)
     bool inserted = active_blocks.insert(block).second;
     TORCH_INTERNAL_ASSERT_DEBUG_ONLY(inserted);
+    if (block->pool->owner_PrivatePool) {
+      block->pool->owner_PrivatePool->active_blocks_count++;
+    }
 
     for_each_selected_stat_type(params.stat_types, [&](size_t stat_type) {
       stats.allocation[stat_type].increase(1);
@@ -2874,6 +2881,13 @@ class DeviceCachingAllocator {
     }
 
     active_blocks.erase(block);
+    if (pool.owner_PrivatePool) {
+      pool.owner_PrivatePool->active_blocks_count--;
+      if (pool.owner_PrivatePool->active_blocks_count == 0 &&
+          pool.owner_PrivatePool->use_count == 0) {
+        release_cached_blocks(context, pool.owner_PrivatePool->id);
+      }
+    }
     // Makes sure the Block* isn't already present in the pool we're freeing it
     // back into.
     // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores)
