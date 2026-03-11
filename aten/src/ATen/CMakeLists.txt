@@ -977,6 +977,13 @@ else()
   add_subdirectory(test)
 endif()
 
+# Simple GPU kernel instantiation library (opt-in via BUILD_SIMPLE_GPU_KERNELS)
+if(USE_CUDA AND BUILD_SIMPLE_GPU_KERNELS)
+  add_subdirectory(
+      "${CMAKE_SOURCE_DIR}/tools/gpu_kernel_lib"
+      "${CMAKE_BINARY_DIR}/gpu_kernel_lib")
+endif()
+
 list(APPEND ATen_MOBILE_BENCHMARK_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/tensor_add.cpp)
 list(APPEND ATen_MOBILE_BENCHMARK_SRCS
