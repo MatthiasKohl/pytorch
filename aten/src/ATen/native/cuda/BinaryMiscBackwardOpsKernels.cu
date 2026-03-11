@@ -15,6 +15,32 @@
 
 namespace at::native {
 
+template <typename scalar_t>
+struct SigmoidBackwardFunctor {
+  // only float and double are simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = (
+    std::is_same_v<scalar_t, float> ||
+    std::is_same_v<scalar_t, double>);
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a, scalar_t b) const {
+    return a * (scalar_t(1.) - b) * b;
+  }
+};
+
+template <typename scalar_t>
+struct TanhBackwardFunctor {
+  // only float and double are simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = (
+    std::is_same_v<scalar_t, float> ||
+    std::is_same_v<scalar_t, double>);
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a, scalar_t b) const {
+    return a * (scalar_t{1.} - b * b);
+  }
+};
+
 constexpr char sigmoid_backward_name[] = "sigmoid_backward";
 void sigmoid_backward_kernel_cuda(TensorIteratorBase& iter) {
   auto dtype = iter.dtype();
@@ -46,9 +72,7 @@ void sigmoid_backward_kernel_cuda(TensorIteratorBase& iter) {
 #endif
   } else {
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, dtype, "sigmoid_backward_cuda", [&]() {
-      gpu_kernel(iter, []GPU_LAMBDA(scalar_t a, scalar_t b) -> scalar_t {
-        return a * (scalar_t(1.) - b) * b;
-      });
+      gpu_kernel(iter, SigmoidBackwardFunctor<scalar_t>());
     });
   }
 }
@@ -117,9 +141,7 @@ void tanh_backward_kernel_cuda(TensorIteratorBase& iter) {
 #endif
   } else {
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, dtype, "tanh_backward_cuda", [&]() {
-      gpu_kernel(iter, [] GPU_LAMBDA(scalar_t a, scalar_t b) -> scalar_t {
-        return a * (scalar_t{1.} - b * b);
-      });
+      gpu_kernel(iter, TanhBackwardFunctor<scalar_t>());
     });
   }
 }

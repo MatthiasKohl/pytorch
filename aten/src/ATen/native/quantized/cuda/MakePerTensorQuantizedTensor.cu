@@ -17,6 +17,17 @@
 
 namespace at::native {
 
+template <typename scalar_t, typename underlying_t>
+struct AssignQuantizedFunctor {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
+  GPU_LAMBDA scalar_t operator()(underlying_t value) const {
+    return scalar_t(value);
+  }
+};
+
 void assign_quantized_tensor_cuda(
   const Tensor& self, Tensor& dst) {
   AT_DISPATCH_QINT_TYPES(
@@ -26,9 +37,7 @@ void assign_quantized_tensor_cuda(
           .add_output(dst)
           .add_input(self)
           .build();
-        gpu_kernel(iter, [] GPU_LAMBDA(underlying_t value) -> scalar_t {
-          return scalar_t(value);
-        });
+        gpu_kernel(iter, AssignQuantizedFunctor<scalar_t, underlying_t>());
       });
 }
 

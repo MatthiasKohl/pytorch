@@ -1711,31 +1711,36 @@ Tensor index_select_quantized_cuda(const Tensor& self, int64_t dim, const Tensor
   return out;
 }
 
+template <typename scalar_t>
+struct MaskedFillFunctor {
+  // only complex double is non-simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = !(
+    std::is_same_v<scalar_t, c10::complex<double>>);
+
+  GPU_LAMBDA scalar_t operator()(scalar_t self, bool mask) const {
+    if (mask) {
+      return value_;
+    }
+    return self;
+  }
+  MaskedFillFunctor(scalar_t value) : value_(value) {}
+  private:
+  scalar_t value_;
+};
+
 namespace {
 
 void masked_fill_kernel(TensorIterator& iter, const Scalar& value) {
   AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4(
       kBool, kHalf, kBFloat16, kComplexHalf, iter.common_dtype(), "masked_fill_", [&]() {
-        const auto value_ = value.to<scalar_t>();
-        gpu_kernel(
-            iter, [value_] GPU_LAMBDA(scalar_t self, bool mask) -> scalar_t {
-              if (mask) {
-                return value_;
-              }
-              return self;
-            });
+        gpu_kernel(iter, MaskedFillFunctor<scalar_t>(value.to<scalar_t>()));
       });
 }
 
 template <typename scalar_t>
 void cuda_masked_fill_kernel_quantized(TensorIterator& iter, scalar_t quantized_val) {
-    gpu_kernel(
-        iter, [quantized_val] GPU_LAMBDA(scalar_t self, bool mask) -> scalar_t {
-          if (mask) {
-            return quantized_val;
-          }
-          return self;
-    });
+    gpu_kernel(iter, MaskedFillFunctor<scalar_t>(quantized_val));
 }
 
 void masked_fill_kernel_quantized(TensorIterator& iter, const Scalar& value, double scale, int zero_point) {

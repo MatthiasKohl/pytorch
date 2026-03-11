@@ -10,31 +10,49 @@
 
 namespace at::native {
 
+template <typename scalar_t>
+struct LshiftFunctor {
+  // only non-simple cases are: signed char with binary functor.
+  template <int /*cc_major*/, int /*cc_minor*/, FunctorType functor_type>
+  static constexpr bool is_simple = !(
+    std::is_same_v<scalar_t, signed char> && functor_type == FunctorType::Binary);
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a, scalar_t b) const {
+    constexpr scalar_t max_shift = sizeof(scalar_t) * CHAR_BIT;
+    if ((static_cast<std::make_signed_t<scalar_t>>(b) < 0) || (b >= max_shift)) {
+      return 0;
+    }
+    return static_cast<std::make_unsigned_t<scalar_t>>(a) << b;
+  }
+};
+
+template <typename scalar_t>
+struct RshiftFunctor {
+  // only non-simple cases are: signed char with binary functor and SM 100+,
+  // unsigned char with binary functor.
+  template <int cc_major, int /*cc_minor*/, FunctorType functor_type>
+  static constexpr bool is_simple = !(
+    (std::is_same_v<scalar_t, signed char> && functor_type == FunctorType::Binary && cc_major >= 10) ||
+    (std::is_same_v<scalar_t, unsigned char> && functor_type == FunctorType::Binary));
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a, scalar_t b) const {
+    constexpr scalar_t max_shift = sizeof(scalar_t) * CHAR_BIT - std::is_signed_v<scalar_t>;
+    if ((static_cast<std::make_signed_t<scalar_t>>(b) < 0) || (b >= max_shift)) {
+      return a >> max_shift;
+    }
+    return a >> b;
+  }
+};
 
 void lshift_kernel_cuda(TensorIteratorBase& iter) {
   AT_DISPATCH_INTEGRAL_TYPES(iter.dtype(), "lshift_cuda", [&]() {
-    gpu_kernel_with_scalars(iter,
-      []GPU_LAMBDA(scalar_t a, scalar_t b) -> scalar_t {
-        constexpr scalar_t max_shift = sizeof(scalar_t) * CHAR_BIT;
-        if ((static_cast<std::make_signed_t<scalar_t>>(b) < 0) || (b >= max_shift)) {
-          return 0;
-        }
-        return static_cast<std::make_unsigned_t<scalar_t>>(a) << b;
-    });
+    gpu_kernel_with_scalars(iter, LshiftFunctor<scalar_t>());
   });
 }
 
 void rshift_kernel_cuda(TensorIteratorBase& iter) {
   AT_DISPATCH_INTEGRAL_TYPES(iter.dtype(), "rshift_cuda", [&]() {
-    gpu_kernel_with_scalars(iter,
-      []GPU_LAMBDA(scalar_t a, scalar_t b) -> scalar_t {
-        // right shift value to retain sign bit for signed and no bits for unsigned
-        constexpr scalar_t max_shift = sizeof(scalar_t) * CHAR_BIT - std::is_signed_v<scalar_t>;
-        if ((static_cast<std::make_signed_t<scalar_t>>(b) < 0) || (b >= max_shift)) {
-          return a >> max_shift;
-        }
-        return a >> b;
-    });
+    gpu_kernel_with_scalars(iter, RshiftFunctor<scalar_t>());
   });
 }
 

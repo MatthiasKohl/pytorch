@@ -12,6 +12,55 @@
 
 namespace at::native {
 
+template <typename scalar_t, typename accscalar_t>
+struct AddcmulFunctor {
+  // only simple cases are float, double with SM 90- and int
+  template <int cc_major, int /*cc_minor*/>
+  static constexpr bool is_simple = (
+    std::is_same_v<scalar_t, float> ||
+    (std::is_same_v<scalar_t, double> && cc_major <= 9) ||
+    std::is_same_v<scalar_t, int>);
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a, scalar_t b, scalar_t c) const {
+    return pointwise_op_impl<accscalar_t>(a, b, c, alpha, std::multiplies<accscalar_t>());
+  }
+  AddcmulFunctor(accscalar_t alpha_) : alpha(alpha_) {}
+ private:
+  accscalar_t alpha;
+};
+
+template <typename scalar_t, typename accscalar_t>
+struct AddcmulScalarTensor2Functor {
+  // only non-simple case is bf16 with SM 75-
+  template <int cc_major, int /*cc_minor*/>
+  static constexpr bool is_simple = !(
+    std::is_same_v<scalar_t, c10::BFloat16> && cc_major < 8);
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a, scalar_t b) const {
+    return pointwise_op_impl<accscalar_t>(a, b, c, alpha, std::multiplies<accscalar_t>());
+  }
+  AddcmulScalarTensor2Functor(accscalar_t alpha_, accscalar_t c_) : alpha(alpha_), c(c_) {}
+ private:
+  accscalar_t alpha;
+  accscalar_t c;
+};
+
+template <typename scalar_t>
+struct MseBackwardFunctor {
+  // only simple cases are float and double
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = (
+    std::is_same_v<scalar_t, float> ||
+    std::is_same_v<scalar_t, double>);
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a, scalar_t b, scalar_t c) const {
+    return alpha * (a - b) * c;
+  }
+  MseBackwardFunctor(scalar_t alpha_) : alpha(alpha_) {}
+ private:
+  scalar_t alpha;
+};
+
 void addcmul_cuda_scalar_tensor2_kernel(
   TensorIteratorBase& iter,
   const Scalar& scalar_tensor2,
@@ -84,9 +133,7 @@ void addcmul_cuda_kernel(TensorIteratorBase& iter, const Scalar& value) {
       // and do math in fp32 for better accuracy.
       using accscalar_t = at::acc_type<scalar_t, true>;
       auto alpha = value.to<accscalar_t>();
-      gpu_kernel(iter, [alpha]GPU_LAMBDA(scalar_t a, scalar_t b, scalar_t c) -> scalar_t {
-        return pointwise_op_impl<accscalar_t>(a, b, c, alpha, std::multiplies<accscalar_t>());
-      });
+      gpu_kernel(iter, AddcmulFunctor<scalar_t, accscalar_t>(alpha));
     });
   }
 }
@@ -133,9 +180,7 @@ void addcmul_cuda_scalar_tensor2_kernel(TensorIteratorBase& iter, const Scalar& 
       using accscalar_t = at::acc_type<scalar_t, true>;
       auto c = scalar_tensor2.to<accscalar_t>();
       auto alpha = value.to<accscalar_t>();
-      gpu_kernel(iter, [alpha, c]GPU_LAMBDA(scalar_t a, scalar_t b) -> scalar_t {
-        return pointwise_op_impl<accscalar_t>(a, b, c, alpha, std::multiplies<accscalar_t>());
-      });
+      gpu_kernel(iter, AddcmulScalarTensor2Functor<scalar_t, accscalar_t>(alpha, c));
     });
   }
 }
@@ -222,9 +267,7 @@ void huber_backward_cuda_kernel(TensorIterator& iter, const Scalar& norm, double
 void mse_backward_cuda_kernel(TensorIterator& iter, const Scalar& value) {
   AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, iter.dtype(), "mse_backward_cuda", [&]() {
     auto alpha = value.to<scalar_t>();
-    gpu_kernel(iter, [alpha]GPU_LAMBDA(scalar_t a, scalar_t b, scalar_t c) -> scalar_t {
-      return alpha * (a - b) * c;
-    });
+    gpu_kernel(iter, MseBackwardFunctor<scalar_t>(alpha));
   });
 }
 

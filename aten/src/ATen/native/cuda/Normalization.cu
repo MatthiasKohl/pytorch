@@ -94,6 +94,18 @@ inline Impl batch_norm_choose_impl(const Tensor& in1, const Tensor& in2) {
   return imp1 == imp2 ? imp1 : Impl::General;
 }
 
+template <typename scalar_t, typename acc_t>
+struct BatchNormElementwiseFunctor {
+  // only simple case is float
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = std::is_same_v<scalar_t, float>;
+
+  GPU_LAMBDA scalar_t operator()(scalar_t input, acc_t weight, acc_t bias,
+                                  acc_t mean, acc_t invstd) const {
+    return (input - mean) * weight * invstd + bias;
+  }
+};
+
 void batch_norm_elementwise(
     const Tensor& out, const Tensor& self, const std::optional<Tensor>& weight_opt,
     const std::optional<Tensor>& bias_opt, const Tensor& mean_, const Tensor& invstd_) {
@@ -167,10 +179,7 @@ void batch_norm_elementwise(
     AT_DISPATCH_FLOATING_TYPES_AND2(kBFloat16, kHalf, self.scalar_type(),
                                     "batch_norm_elementwise_cuda", [&] {
       using acc_t = at::acc_type<scalar_t, true>;
-      gpu_kernel(iter, [] GPU_LAMBDA (scalar_t input, acc_t weight, acc_t bias,
-                                      acc_t mean, acc_t invstd) -> scalar_t {
-        return (input - mean) * weight * invstd + bias;
-      });
+      gpu_kernel(iter, BatchNormElementwiseFunctor<scalar_t, acc_t>());
     });
     return;
   }
@@ -252,6 +261,30 @@ Tensor batch_norm_elementwise_backward_train(
   TORCH_INTERNAL_ASSERT(false);
 }
 
+template <typename scalar_t, typename accscalar_t>
+struct BatchNormEvalBackwardWeightedFunctor {
+  // only non-simple case is bf16 with SM 75-
+  template <int cc_major, int /*cc_minor*/>
+  static constexpr bool is_simple = !(
+    std::is_same_v<scalar_t, c10::BFloat16> && cc_major < 8);
+
+  GPU_LAMBDA scalar_t operator()(scalar_t gO, accscalar_t invstd, accscalar_t weight) const {
+    return gO * weight * invstd;
+  }
+};
+
+template <typename scalar_t, typename accscalar_t>
+struct BatchNormEvalBackwardFunctor {
+  // only non-simple case is bf16 with SM 75-
+  template <int cc_major, int /*cc_minor*/>
+  static constexpr bool is_simple = !(
+    std::is_same_v<scalar_t, c10::BFloat16> && cc_major < 8);
+
+  GPU_LAMBDA scalar_t operator()(scalar_t gO, accscalar_t invstd) const {
+    return gO * invstd;
+  }
+};
+
 Tensor batch_norm_elementwise_backward_eval(
     const Tensor& grad_out, const Tensor& input,
     const Tensor& invstd, const Tensor& weight) {
@@ -277,10 +310,7 @@ Tensor batch_norm_elementwise_backward_eval(
     AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, grad_out.scalar_type(),
                                     "batch_norm_eval_backward", [&]{
       using accscalar_t = at::acc_type<scalar_t, true>;
-      gpu_kernel(iter, [] GPU_LAMBDA (scalar_t gO, accscalar_t invstd, accscalar_t weight)
-                 -> scalar_t {
-          return gO * weight * invstd;
-      });
+      gpu_kernel(iter, BatchNormEvalBackwardWeightedFunctor<scalar_t, accscalar_t>());
     });
   } else {
     auto iter = TensorIteratorConfig()
@@ -294,9 +324,7 @@ Tensor batch_norm_elementwise_backward_eval(
     AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, grad_out.scalar_type(),
                                     "batch_norm_eval_backward", [&]{
       using accscalar_t = at::acc_type<scalar_t, true>;
-      gpu_kernel(iter, [] GPU_LAMBDA (scalar_t gO, accscalar_t invstd) -> scalar_t {
-          return gO * invstd;
-      });
+      gpu_kernel(iter, BatchNormEvalBackwardFunctor<scalar_t, accscalar_t>());
     });
   }
   return grad_input;
@@ -414,6 +442,23 @@ void batch_norm_update_stats_and_invert(
   });
 }
 
+template <typename scalar_t, typename acc_t>
+struct BatchNormCalcInvstdFunctor {
+  // only simple cases are half and bf16
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = (
+    std::is_same_v<scalar_t, c10::Half> ||
+    std::is_same_v<scalar_t, c10::BFloat16>);
+
+  GPU_LAMBDA acc_t operator()(scalar_t var) const {
+    return c10::cuda::compat::rsqrt(var + eps_);
+  }
+
+  BatchNormCalcInvstdFunctor(acc_t eps) : eps_(eps) {}
+private:
+  acc_t eps_;
+};
+
 void batch_norm_calc_invstd(const Tensor& out_invstd, const Tensor& running_var, double epsilon) {
   auto iter = TensorIteratorConfig()
       .add_output(out_invstd)
@@ -425,9 +470,7 @@ void batch_norm_calc_invstd(const Tensor& out_invstd, const Tensor& running_var,
                                   "batch_norm_invert_std_cuda", [&] {
     using acc_t = at::acc_type<scalar_t, true>;
     auto eps = static_cast<acc_t>(epsilon);
-    gpu_kernel(iter, [eps] GPU_LAMBDA (scalar_t var) -> acc_t {
-      return c10::cuda::compat::rsqrt(var + eps);
-    });
+    gpu_kernel(iter, BatchNormCalcInvstdFunctor<scalar_t, acc_t>(eps));
   });
 }
 }

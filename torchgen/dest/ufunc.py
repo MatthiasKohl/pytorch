@@ -206,10 +206,26 @@ def compute_ufunc_cuda_functors(
             g, name=f"ufunc::{ufunc_name}", compute_t=BaseCType(opmath_t)
         )
         apply_ctx = ufunctor_sig.fields() + ufunctor_sig.arguments().apply
+        if ufunc_name == "add":
+            # for addition, non-simple cases are complex double,
+            # complex half (except CUDAFunctorOnSelf), and bf16 on sm 75
+            complex_half_cond = "std::is_same_v<scalar_t, c10::complex<c10::Half>> ||\n    "
+            if k == UfuncKey.CUDAFunctorOnSelf:
+                complex_half_cond = ""
+            is_simple_str = f"""template <int cc_major, int /*cc_minor*/>
+  static constexpr bool is_simple = !(
+    std::is_same_v<scalar_t, c10::complex<double>> ||
+    {complex_half_cond}(std::is_same_v<scalar_t, c10::BFloat16> && cc_major < 8));"""
+        else:
+            # all other ufuncs (currently none) are set to non-simple by default
+            is_simple_str = """template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = false;"""
         ufunctors.append(
             f"""
 template <typename scalar_t>
 struct {ufunctor_sig.name} {{
+  {is_simple_str}
+
   using opmath_t = at::opmath_type<scalar_t>;
   {ufunctor_sig.decl_fields()}
   {ufunctor_sig.inline_defn_ctor()}

@@ -20,6 +20,61 @@ namespace {
 
 void pow_tensor_scalar_kernel(TensorIteratorBase& iter, const Scalar& exp_scalar);
 
+template <typename Base_type>
+struct PowSquareFunctor {
+  // only non-simple cases are unsigned char and complex double/float
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = !(
+    std::is_same_v<Base_type, unsigned char> ||
+    std::is_same_v<Base_type, c10::complex<double>> ||
+    std::is_same_v<Base_type, c10::complex<float>>);
+
+  GPU_LAMBDA Base_type operator()(Base_type base) const {
+    return base * base;
+  }
+};
+
+template <typename Base_type>
+struct PowCubeFunctor {
+  // only non-simple cases are long, double with SM 10.3 / 11.x / 12.x,
+  // bf16 with SM 75-
+  template <int cc_major, int cc_minor>
+  static constexpr bool is_simple = !(
+    std::is_same_v<Base_type, long> ||
+    (std::is_same_v<Base_type, double> && (
+      (cc_major >= 10 && cc_minor == 3) || cc_major == 11 || cc_major == 12) ||
+    (std::is_same_v<Base_type, c10::BFloat16> && cc_major < 8)));
+
+  GPU_LAMBDA Base_type operator()(Base_type base) const {
+    return base * base * base;
+  }
+};
+
+template <typename Base_type>
+struct PowInvSquareFunctor {
+  // never simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = false;
+
+  GPU_LAMBDA Base_type operator()(Base_type base) const {
+    return 1.0 / (base * base);
+  }
+};
+
+template <typename Base_type, typename Exp_type>
+struct PowTensorScalarFunctor {
+  // never simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = false;
+
+  GPU_LAMBDA Base_type operator()(Base_type base) const {
+    return pow_(base, exp);
+  }
+  PowTensorScalarFunctor(Exp_type exp_) : exp(exp_) {}
+ private:
+  Exp_type exp;
+};
+
 template <typename scalar_t>
 void pow_scalar_tensor_impl(TensorIteratorBase& iter, scalar_t base) {
   gpu_kernel(iter, [=]GPU_LAMBDA(scalar_t exp) -> scalar_t {
@@ -149,21 +204,13 @@ void pow_tensor_scalar_kernel_impl(TensorIteratorBase& iter,
   // .5 (sqrt), -.5 (rsqrt) and -1 (reciprocal) specializations are handled
   // in pow_tensor_scalar_kernel
   if (d_exp == 2) {
-    gpu_kernel(iter, [=]GPU_LAMBDA(Base_type base) -> Base_type {
-      return base * base;
-    });
+    gpu_kernel(iter, PowSquareFunctor<Base_type>());
   } else if (d_exp == 3) {
-    gpu_kernel(iter, [=]GPU_LAMBDA(Base_type base) -> Base_type {
-      return base * base * base;
-    });
+    gpu_kernel(iter, PowCubeFunctor<Base_type>());
   } else if (d_exp == -2) {
-    gpu_kernel(iter, [=]GPU_LAMBDA(Base_type base) -> Base_type {
-      return 1.0 / (base * base);
-    });
+    gpu_kernel(iter, PowInvSquareFunctor<Base_type>());
   } else {
-    gpu_kernel(iter, [=]GPU_LAMBDA(Base_type base) -> Base_type {
-      return pow_(base, exp);
-    });
+    gpu_kernel(iter, PowTensorScalarFunctor<Base_type, Exp_type>(exp));
   }
 }
 
@@ -186,9 +233,7 @@ void pow_tensor_scalar_kernel(TensorIteratorBase& iter, const Scalar& exp_scalar
     }
     AT_DISPATCH_COMPLEX_TYPES(iter.common_dtype(), "pow_cuda", [&]() {
       if (exp_scalar.equal(2.0)) {
-        gpu_kernel(iter, [=]GPU_LAMBDA(scalar_t base) -> scalar_t {
-          return base * base;
-        });
+        gpu_kernel(iter, PowSquareFunctor<scalar_t>());
         return;
       }
       const auto exp = exp_scalar.to<scalar_t>();

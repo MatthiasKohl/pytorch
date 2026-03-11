@@ -25,6 +25,28 @@ __host__ __device__ static inline c10::complex<T> angle_wrapper(c10::complex<T> 
   return c10::complex<T>{std::arg(v), 0};
 }
 
+template <typename scalar_t>
+struct AngleFunctor {
+  // only float is simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = std::is_same_v<scalar_t, float>;
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a) const {
+    return angle_wrapper(a);
+  }
+};
+
+template <typename scalar_t>
+struct ConjFunctor {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a) const {
+    return std::conj(a);
+  }
+};
+
 #if AT_USE_JITERATOR()
 constexpr char angle_name[] = "angle_kernel";
 #endif
@@ -55,9 +77,7 @@ void angle_kernel_cuda(TensorIteratorBase& iter) {
 #endif
   } else {
     AT_DISPATCH_FLOATING_TYPES(dtype, "angle_cuda", [&]() {
-        gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> scalar_t {
-          return angle_wrapper(a);
-        });
+        gpu_kernel(iter, AngleFunctor<scalar_t>());
     });
   }
 }
@@ -76,9 +96,7 @@ void conj_kernel_cuda(TensorIteratorBase& iter) {
       );
       jitted_gpu_kernel<conj_name, scalar_t, scalar_t, 1>(iter, conj_string);
     #else
-      gpu_kernel(iter, [] GPU_LAMBDA(scalar_t a) -> scalar_t {
-          return std::conj(a);
-      });
+      gpu_kernel(iter, ConjFunctor<scalar_t>());
     #endif
   };
 
@@ -88,9 +106,7 @@ void conj_kernel_cuda(TensorIteratorBase& iter) {
       direct_copy_kernel_cuda(iter);
     })
     AT_DISPATCH_CASE_COMPLEX_TYPES([&] {
-      gpu_kernel(iter, [] GPU_LAMBDA(scalar_t a) -> scalar_t {
-        return std::conj(a);
-      });
+      gpu_kernel(iter, ConjFunctor<scalar_t>());
     })
     AT_DISPATCH_CASE(kComplexHalf, conj_chalf)
   );

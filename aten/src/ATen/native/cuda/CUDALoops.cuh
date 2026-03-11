@@ -51,6 +51,18 @@
 
 namespace at::native {
 
+template <typename func_t, int cc_major, int cc_minor, typename = void>
+struct get_is_simple {
+  static constexpr bool value = false;
+};
+
+template <typename func_t, int cc_major, int cc_minor>
+struct get_is_simple<func_t, cc_major, cc_minor, std::void_t<
+      decltype(func_t::template is_simple<cc_major, cc_minor>)>
+    > {
+  static constexpr bool value = func_t::template is_simple<cc_major, cc_minor>;
+};
+  
 #ifdef USE_ROCM
 // Custom configuration for vectorized elementwise kernel
 // with template instantiation.

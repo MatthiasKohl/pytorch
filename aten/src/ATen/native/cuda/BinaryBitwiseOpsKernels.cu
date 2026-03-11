@@ -12,6 +12,10 @@ namespace at::native {
 
 template<typename scalar_t>
 struct BitwiseAndFunctor {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
   __device__ __forceinline__ scalar_t operator()(scalar_t a, scalar_t b) const {
     return a & b;
   }
@@ -19,6 +23,10 @@ struct BitwiseAndFunctor {
 
 template<>
 struct BitwiseAndFunctor<bool> {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
   __device__ __forceinline__ bool operator()(bool a, bool b) const {
     return a && b;
   }
@@ -33,6 +41,10 @@ void bitwise_and_kernel_cuda(TensorIteratorBase& iter) {
 
 template<typename scalar_t>
 struct BitwiseOrFunctor {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
   __device__ __forceinline__ scalar_t operator()(scalar_t a, scalar_t b) const {
     return a | b;
   }
@@ -40,6 +52,10 @@ struct BitwiseOrFunctor {
 
 template<>
 struct BitwiseOrFunctor<bool> {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
   __device__ __forceinline__ bool operator()(bool a, bool b) const {
     return a || b;
   }
@@ -54,6 +70,10 @@ void bitwise_or_kernel_cuda(TensorIteratorBase& iter) {
 
 template<typename scalar_t>
 struct BitwiseXorFunctor {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
   __device__ __forceinline__ scalar_t operator()(scalar_t a, scalar_t b) const {
     return a ^ b;
   }
@@ -61,6 +81,10 @@ struct BitwiseXorFunctor {
 
 template<>
 struct BitwiseXorFunctor<bool> {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
   __device__ __forceinline__ bool operator()(bool a, bool b) const {
     return a != b;
   }

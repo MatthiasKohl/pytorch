@@ -8,14 +8,23 @@
 // of a __device__ lambda not have internal linkage.
 
 namespace at::native {
+
+template <typename scalar_t>
+struct ComplexFunctor {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
+  GPU_LAMBDA c10::complex<scalar_t> operator()(scalar_t a, scalar_t b) const {
+    return c10::complex<scalar_t>(a, b);
+  }
+};
+
 namespace {
 
 void complex_kernel_cuda(TensorIterator& iter) {
   AT_DISPATCH_FLOATING_TYPES_AND(kHalf, iter.input_dtype(0), "complex_cuda", [&]() {
-    gpu_kernel(
-      iter, [] GPU_LAMBDA(scalar_t a, scalar_t b) -> c10::complex<scalar_t> {
-        return c10::complex<scalar_t>(a, b);
-      });
+    gpu_kernel(iter, ComplexFunctor<scalar_t>());
   });
 }
 

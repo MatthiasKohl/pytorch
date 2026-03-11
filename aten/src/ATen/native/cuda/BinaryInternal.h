@@ -19,6 +19,12 @@ namespace at::native::binary_internal {
 
 template <typename scalar_t>
 struct DivFunctor {
+  // never simple (by default)
+  // note: may be used with or without scalars so we just use a default value
+  // for the functor type
+  template <int /*cc_major*/, int /*cc_minor*/, FunctorType /*functor_type*/ = FunctorType::Binary>
+  static constexpr bool is_simple = false;
+
   __device__ scalar_t operator()(scalar_t a, scalar_t b) const {
     return a / b;
   }
@@ -26,6 +32,13 @@ struct DivFunctor {
 
 template <typename T>
 struct MulFunctor {
+  // only complex double, complex half with binary functor and bf16 with SM 75- are not simple
+  template <int cc_major, int /*cc_minor*/, FunctorType functor_type>
+  static constexpr bool is_simple =
+    !(std::is_same_v<T, c10::complex<double>> ||
+      (std::is_same_v<T, c10::complex<c10::Half>> && functor_type == FunctorType::Binary) ||
+      (std::is_same_v<T, c10::BFloat16> && cc_major < 8));
+
   __device__ T operator()(T a, T b) const {
     return a * b;
   }
@@ -35,10 +48,15 @@ struct MulFunctor {
 // [-Werror=int-in-bool-context]
 template <>
 struct MulFunctor<bool> {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/, FunctorType /*functor_type*/>
+  static constexpr bool is_simple = true;
+
   __device__ bool operator()(bool a, bool b) const {
     return a && b;
   }
 };
+
 void div_true_kernel_cuda(TensorIteratorBase& iter);
 void div_trunc_kernel_cuda(TensorIteratorBase& iter);
 } // namespace at::native::binary_internal

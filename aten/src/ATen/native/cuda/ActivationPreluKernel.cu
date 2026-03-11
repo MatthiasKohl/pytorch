@@ -18,15 +18,25 @@
 
 namespace at::native {
 
+template <typename scalar_t>
+struct PreluFunctor {
+  // only half and float are simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = (
+    std::is_same_v<scalar_t, c10::Half> ||
+    std::is_same_v<scalar_t, float>);
+
+  GPU_LAMBDA scalar_t operator()(scalar_t input, scalar_t weight) const {
+    return (input > 0) ? input : weight * input;
+  }
+};
+
 // -----------------------------------
 // prelu
 // -----------------------------------
 void prelu_kernel(TensorIterator &iter) {
   AT_DISPATCH_FLOATING_TYPES_AND2(kBFloat16, kHalf, iter.dtype(), "prelu_cuda", [&] {
-    gpu_kernel(iter,
-      [] GPU_LAMBDA (scalar_t input, scalar_t weight) -> scalar_t {
-        return (input > 0) ? input : weight * input;
-      });
+    gpu_kernel(iter, PreluFunctor<scalar_t>());
   });
 }
 

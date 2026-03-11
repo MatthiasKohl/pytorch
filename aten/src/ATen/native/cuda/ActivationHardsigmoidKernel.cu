@@ -19,6 +19,24 @@
 namespace at::native {
 namespace {
 
+template <typename scalar_t, typename opmath_t>
+struct HardsigmoidFunctor {
+  // only double not simple + bf16 for SM 75-
+  template <int cc_major, int /*cc_minor*/>
+  static constexpr bool is_simple =
+    !(std::is_same_v<scalar_t, double> ||
+     (cc_major < 8 && std::is_same_v<scalar_t, c10::BFloat16>));
+
+  GPU_LAMBDA scalar_t operator() (const scalar_t self_val) const {
+    constexpr opmath_t zero = opmath_t(0.0f);
+    constexpr opmath_t one_sixth = opmath_t(1.0f / 6.0f);
+    constexpr opmath_t three = opmath_t(3.0f);
+    constexpr opmath_t six = opmath_t(6.0f);
+    opmath_t x = static_cast<opmath_t>(self_val);
+    return std::min<opmath_t>(std::max<opmath_t>(x + three, zero), six) * one_sixth;
+  }
+};
+
 void hardsigmoid_kernel(TensorIteratorBase& iter) {
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
@@ -27,19 +45,31 @@ void hardsigmoid_kernel(TensorIteratorBase& iter) {
       "hardsigmoid_cuda",
       [&]() {
         using opmath_t = at::opmath_type<scalar_t>;
-        const opmath_t zero(0.0f);
-        const opmath_t one_sixth(1.0f / 6.0f);
-        const opmath_t three(3.0f);
-        const opmath_t six(6.0f);
-        gpu_kernel(
-            iter,
-            [zero, one_sixth, three, six] GPU_LAMBDA(
-                scalar_t self_val) -> scalar_t {
-              opmath_t x = static_cast<opmath_t>(self_val);
-              return std::min<opmath_t>(std::max<opmath_t>(x + three, zero), six) * one_sixth;
-            });
+        auto functor = HardsigmoidFunctor<scalar_t, opmath_t>();
+        gpu_kernel(iter, functor);
       });
 }
+
+template <typename scalar_t, typename opmath_t>
+struct HardsigmoidBackwardFunctor {
+  // only double not simple + bf16 for SM 75-
+  template <int cc_major, int /*cc_minor*/>
+  static constexpr bool is_simple =
+    !(std::is_same_v<scalar_t, double> ||
+     (cc_major < 8 && std::is_same_v<scalar_t, c10::BFloat16>));
+
+  GPU_LAMBDA scalar_t operator() (const scalar_t grad_val_, const scalar_t self_val_) const {
+    constexpr opmath_t zero = opmath_t(0.0f);
+    constexpr opmath_t three = opmath_t(3.0f);
+    constexpr opmath_t neg_three = opmath_t(-3.0f);
+    constexpr opmath_t one_sixth = opmath_t(1.0f / 6.0f);
+    opmath_t grad_val = static_cast<opmath_t>(grad_val_);
+    opmath_t self_val = static_cast<opmath_t>(self_val_);
+    return (self_val > neg_three && self_val < three)
+        ? grad_val * one_sixth
+        : zero;
+  }
+};
 
 void hardsigmoid_backward_kernel(TensorIteratorBase& iter) {
   AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -49,20 +79,8 @@ void hardsigmoid_backward_kernel(TensorIteratorBase& iter) {
       "hardsigmoid_backward_cuda",
       [&]() {
         using opmath_t = at::opmath_type<scalar_t>;
-        const opmath_t zero(0.0f);
-        const opmath_t three(3.0f);
-        const opmath_t neg_three(-3.0f);
-        const opmath_t one_sixth(1.0f / 6.0f);
-        gpu_kernel(
-            iter,
-            [zero, three, neg_three, one_sixth] GPU_LAMBDA(
-                scalar_t grad_val_, scalar_t self_val_) -> scalar_t {
-              opmath_t grad_val = static_cast<opmath_t>(grad_val_);
-              opmath_t self_val = static_cast<opmath_t>(self_val_);
-              return (self_val > neg_three && self_val < three)
-                  ? grad_val * one_sixth
-                  : zero;
-            });
+        auto functor = HardsigmoidBackwardFunctor<scalar_t, opmath_t>();
+        gpu_kernel(iter, functor);
       });
 }
 

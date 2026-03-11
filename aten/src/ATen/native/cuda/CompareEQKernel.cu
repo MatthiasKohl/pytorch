@@ -16,6 +16,40 @@ enum class EqOpType {EQ, NE};
 
 template<typename scalar_t>
 struct CompareEqFunctor{
+  // only simple cases are:
+  // c10::Float4_e2m1fn_x2 with SM 100+,
+  // unsigned long with SM 100+,
+  // unsigned int,
+  // unsigned short,
+  // bool with SM 100+,
+  // bf16,
+  // half,
+  // complex float,
+  // float,
+  // double with non-binary functor,
+  // short,
+  // long with SM 100+,
+  // int,
+  // signed char with SM 100+,
+  // unsigned char with SM 100+,
+  template <int cc_major, int /*cc_minor*/, FunctorType functor_type>
+  static constexpr bool is_simple =
+    (std::is_same_v<scalar_t, c10::Float4_e2m1fn_x2> && cc_major >= 10) ||
+    (std::is_same_v<scalar_t, unsigned long> && cc_major >= 10) ||
+    (std::is_same_v<scalar_t, unsigned int>) ||
+    (std::is_same_v<scalar_t, unsigned short>) ||
+    (std::is_same_v<scalar_t, bool> && cc_major >= 10) ||
+    (std::is_same_v<scalar_t, c10::BFloat16>) ||
+    (std::is_same_v<scalar_t, c10::Half>) ||
+    (std::is_same_v<scalar_t, c10::complex<float>>) ||
+    (std::is_same_v<scalar_t, float>) ||
+    (std::is_same_v<scalar_t, double> && functor_type != FunctorType::Binary) ||
+    (std::is_same_v<scalar_t, short>) ||
+    (std::is_same_v<scalar_t, long> && cc_major >= 10) ||
+    (std::is_same_v<scalar_t, int>) ||
+    (std::is_same_v<scalar_t, signed char> && cc_major >= 10) ||
+    (std::is_same_v<scalar_t, unsigned char> && cc_major >= 10);
+
   CompareEqFunctor(EqOpType op): op_(op) {}
   const EqOpType op_;
   __device__ __forceinline__ bool operator() (scalar_t a, scalar_t b) const {

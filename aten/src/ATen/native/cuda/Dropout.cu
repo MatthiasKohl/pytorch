@@ -186,6 +186,23 @@ fused_dropout_kernel(cuda::detail::TensorInfo<const scalar_t, IndexType> a,
 }
 
 template<typename mask_t, typename scalar_t, typename accscalar_t>
+struct MaskedScaleFunctor {
+  // only non-simple case is bf16 with SM 75- and double with SM 10.3, 11.x, 12.x
+  template <int cc_major, int cc_minor>
+  static constexpr bool is_simple = !(
+    (std::is_same_v<scalar_t, c10::BFloat16> && cc_major < 8) ||
+    (std::is_same_v<scalar_t, double> && (
+      (cc_major == 10 && cc_minor == 3) || cc_major == 11 || cc_major == 12)));
+
+  GPU_LAMBDA scalar_t operator()(const scalar_t src_val, const mask_t mask_val) const {
+    return (float)mask_val * src_val * scale;
+  }
+  MaskedScaleFunctor(accscalar_t scale_) : scale(scale_) {}
+  private:
+  accscalar_t scale;
+};
+
+template<typename mask_t, typename scalar_t, typename accscalar_t>
 void masked_scale_kernel(at::Tensor& ret, const at::Tensor& src, const at::Tensor& mask, accscalar_t scale){
    auto iter = at::TensorIteratorConfig()
      .check_all_same_dtype(false)
@@ -194,11 +211,7 @@ void masked_scale_kernel(at::Tensor& ret, const at::Tensor& src, const at::Tenso
      .add_const_input(mask)
      .build();
 
-   at::native::gpu_kernel(
-       iter,
-       [=]GPU_LAMBDA(const scalar_t src_val, const mask_t mask_val) -> scalar_t {
-          return (float)mask_val * src_val * scale;
-       });
+   at::native::gpu_kernel(iter, MaskedScaleFunctor<mask_t, scalar_t, accscalar_t>(scale));
 }
 
 template <typename scalar_t>

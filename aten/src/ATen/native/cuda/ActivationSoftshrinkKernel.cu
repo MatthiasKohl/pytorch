@@ -20,6 +20,37 @@
 namespace at::native {
 namespace {
 
+template <typename scalar_t>
+struct SoftshrinkFunctor {
+  // note: code-gen for softshrink seems non-optimal, generating a lot of branching.
+  // thus, this is never marked as simple.
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = false;
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a) const {
+    return at::_isnan(a) ? a : (a > lambd ? a - lambd : (a < -lambd ? a + lambd : scalar_t(0)));
+  }
+  SoftshrinkFunctor(scalar_t lambd_) : lambd(lambd_) {}
+  private:
+  scalar_t lambd;
+};
+
+template <typename scalar_t>
+struct ShrinkBackwardFunctor {
+  // only double not simple + bf16 for SM 75-
+  template <int cc_major, int /*cc_minor*/>
+  static constexpr bool is_simple =
+    !(std::is_same_v<scalar_t, double> ||
+     (cc_major < 8 && std::is_same_v<scalar_t, c10::BFloat16>));
+
+  GPU_LAMBDA scalar_t operator()(scalar_t grad_val, scalar_t self_val) const {
+    return (self_val >= -lambd && self_val <= lambd) ? scalar_t(0) : grad_val;
+  }
+  ShrinkBackwardFunctor(scalar_t lambd_) : lambd(lambd_) {}
+  private:
+  scalar_t lambd;
+};
+
 void softshrink_kernel(TensorIteratorBase& iter, const Scalar& value) {
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
@@ -27,10 +58,8 @@ void softshrink_kernel(TensorIteratorBase& iter, const Scalar& value) {
       iter.dtype(),
       "softshrink_cuda",
       [&]() {
-        auto lambd = value.to<scalar_t>();
-        gpu_kernel(iter, [lambd] GPU_LAMBDA(scalar_t a) -> scalar_t {
-          return at::_isnan(a) ? a : (a > lambd ? a - lambd : (a < -lambd ? a + lambd : scalar_t(0)));
-        });
+        auto functor = SoftshrinkFunctor<scalar_t>(value.to<scalar_t>());
+        gpu_kernel(iter, functor);
       });
 }
 
@@ -41,14 +70,8 @@ void shrink_backward_kernel(TensorIteratorBase& iter, const Scalar& value) {
       iter.dtype(),
       "shrink_backward_cuda",
       [&]() {
-        auto lambd = value.to<scalar_t>();
-        gpu_kernel(
-            iter,
-            [lambd] GPU_LAMBDA(
-                scalar_t grad_val, scalar_t self_val) -> scalar_t {
-              return (self_val >= -lambd && self_val <= lambd) ? scalar_t(0)
-                                                               : grad_val;
-            });
+        auto functor = ShrinkBackwardFunctor<scalar_t>(value.to<scalar_t>());
+        gpu_kernel(iter, functor);
       });
 }
 } // namespace

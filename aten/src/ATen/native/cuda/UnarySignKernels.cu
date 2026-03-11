@@ -14,13 +14,75 @@
 
 namespace at::native {
 
+template <typename scalar_t>
+struct LogicalNotFunctor {
+  // only non-simple case is complex double
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = !(
+    std::is_same_v<scalar_t, c10::complex<double>>);
+
+  GPU_LAMBDA bool operator()(scalar_t a) const { return !a; }
+};
+
+template <typename scalar_t>
+struct NegFunctor {
+  // only non-simple case is complex double
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = !(
+    std::is_same_v<scalar_t, c10::complex<double>>);
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a) const { return -a; }
+};
+
+struct SignBoolFunctor {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
+  GPU_LAMBDA bool operator()(bool a) const { return a; }
+};
+
+template <typename scalar_t>
+struct SignFunctor {
+  // only simple cases are float, short, long, int and unsigned char
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = (
+    std::is_same_v<scalar_t, float> ||
+    std::is_same_v<scalar_t, short> ||
+    std::is_same_v<scalar_t, long> ||
+    std::is_same_v<scalar_t, int> ||
+    std::is_same_v<scalar_t, unsigned char>);
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a) const {
+    return c10::signum(a);
+  }
+};
+
+template <typename scalar_t>
+struct SignbitIntFunctor {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
+  GPU_LAMBDA bool operator()(scalar_t a) const { return is_negative(a); }
+};
+
+template <typename scalar_t, typename opmath_t>
+struct SignbitFloatFunctor {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
+  GPU_LAMBDA bool operator()(scalar_t a) const { return signbit(opmath_t{a}); }
+};
+
 void logical_not_kernel_cuda(TensorIteratorBase& iter) {
   // error check -- this is just ensuring we don't dispatch on types that aren't in ALL_TYPES_AND_COMPLEX_AND3(...)
   // so we don't have to maintain a separate list or to do double dispatch.
   AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND3(kBool, kHalf, kBFloat16, iter.dtype(0), "logical_not_cuda", [&]() {});
 
   AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND3(kBool, kHalf, kBFloat16, iter.dtype(1), "logical_not_cuda", [&]() {
-    gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> bool { return !a; });
+    gpu_kernel(iter, LogicalNotFunctor<scalar_t>());
   });
 }
 
@@ -45,30 +107,22 @@ void neg_kernel_cuda(TensorIteratorBase& iter) {
   });
 #else
   AT_DISPATCH_COMPLEX_TYPES_AND(kComplexHalf, dtype, "neg_cuda", [&]() {
-      gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> scalar_t {
-        return -a;
-      });
+      gpu_kernel(iter, NegFunctor<scalar_t>());
   });
 #endif
   } else {
   AT_DISPATCH_ALL_TYPES_AND2(ScalarType::Half, ScalarType::BFloat16, dtype, "neg_cuda", [&]() {
-    gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> scalar_t {
-      return -a;
-    });
+    gpu_kernel(iter, NegFunctor<scalar_t>());
   });
   }
 }
 
 void sign_kernel_cuda(TensorIteratorBase& iter){
   if (iter.dtype() == ScalarType::Bool) {
-    gpu_kernel(iter, []GPU_LAMBDA(bool a){
-      return a;
-    });
+    gpu_kernel(iter, SignBoolFunctor());
   } else {
     AT_DISPATCH_ALL_TYPES_AND2(ScalarType::Half, ScalarType::BFloat16, iter.dtype(), "sign_cuda", [&]() {
-        gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> scalar_t {
-            return c10::signum(a);
-        });
+        gpu_kernel(iter, SignFunctor<scalar_t>());
     });
   }
 }
@@ -77,12 +131,12 @@ void signbit_kernel_cuda(TensorIteratorBase& iter){
   // NOTE: signbit does not always support integral arguments.
   if (at::isIntegralType(iter.input_dtype(), /*includeBool=*/false)) {
     AT_DISPATCH_INTEGRAL_TYPES(iter.input_dtype(), "signbit_cuda", [&]() {
-      gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> bool { return is_negative(a); });
+      gpu_kernel(iter, SignbitIntFunctor<scalar_t>());
     });
   } else {
     AT_DISPATCH_FLOATING_TYPES_AND2(kBFloat16, ScalarType::Half, iter.input_dtype(), "signbit_cuda", [&]() {
       using opmath_t = at::opmath_type<scalar_t>;
-      gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> bool { return signbit(opmath_t{a}); });
+      gpu_kernel(iter, SignbitFloatFunctor<scalar_t, opmath_t>());
     });
   }
 }

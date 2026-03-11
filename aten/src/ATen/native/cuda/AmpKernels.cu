@@ -37,6 +37,29 @@ static __host__ __device__ __forceinline__ int isfinite_ensure_cuda_math(float v
 
 namespace at::native {
 
+template <typename scalar_t, typename opmath_t>
+struct AmpNonFiniteCheckAndUnscaleFunctor {
+  // only double is not simple
+  // note: if instantiations get extended to bf16, SM 75- will likely not be simple.
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = !(std::is_same_v<scalar_t, double>);
+
+  GPU_LAMBDA scalar_t operator()(scalar_t val_in) const {
+    auto val = static_cast<opmath_t>(val_in);
+    if (!isfinite_ensure_cuda_math(val)) {
+      *found_inf_ptr = 1.f;
+    }
+    // Every thread accesses inv_scale, but it will hit in cache.
+    const auto inv_scale_val = *inv_scale_ptr;
+    return static_cast<scalar_t>(inv_scale_val == 1.f ? val : val * inv_scale_val);
+  }
+  AmpNonFiniteCheckAndUnscaleFunctor(float* found_inf_ptr_, const float* inv_scale_ptr_)
+    : found_inf_ptr(found_inf_ptr_), inv_scale_ptr(inv_scale_ptr_) {}
+  private:
+  float* found_inf_ptr;
+  const float* inv_scale_ptr;
+};
+
 namespace {
 // Single-tensor fallback for _amp_foreach_non_finite_check_and_unscale_cuda_.
 // Handles individual tensors that are acceptable to unscale but not MTA-safe.
@@ -61,16 +84,7 @@ void _amp_non_finite_check_and_unscale_cuda_(Tensor& scaled_grad,
 
       using opmath_t = at::opmath_type<scalar_t>;
 
-      gpu_kernel(iter,
-                 [found_inf_ptr, inv_scale_ptr] GPU_LAMBDA (scalar_t val_in) -> scalar_t {
-                   auto val = static_cast<opmath_t>(val_in);
-                   if (!isfinite_ensure_cuda_math(val)) {
-                     *found_inf_ptr = 1.f;
-                   }
-                   // Every thread accesses inv_scale, but it will hit in cache.
-                   const auto inv_scale_val = *inv_scale_ptr;
-                   return static_cast<scalar_t>(inv_scale_val == 1.f ? val : val * inv_scale_val);
-                 });
+      gpu_kernel(iter, AmpNonFiniteCheckAndUnscaleFunctor<scalar_t, opmath_t>(found_inf_ptr, inv_scale_ptr));
     });
 }
 } // anonymous namespace

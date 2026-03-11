@@ -36,6 +36,35 @@ void check_zero_points_cuda(
     "zero_point is above upper bound.");
 }
 
+template <typename scalar_t>
+struct DequantizePerTensorFunctor {
+  // only non-simple cases are SM 10.3 / 11.x / 12.x
+  // note: this is due to scale being a double
+  template <int cc_major, int cc_minor>
+  static constexpr bool is_simple = !(
+    (cc_major == 10 && cc_minor == 3) || cc_major == 11 || cc_major == 12);
+
+  GPU_LAMBDA float operator()(scalar_t value) const {
+    return (static_cast<float>(value.val_) - zero_point) * scale;
+  }
+  DequantizePerTensorFunctor(double scale_, int64_t zero_point_)
+    : scale(scale_), zero_point(zero_point_) {}
+  private:
+  double scale;
+  int64_t zero_point;
+};
+
+template <typename scalar_t>
+struct DequantizePerChannelFloatQParamsFunctor {
+  // only non-simple case is c10::qint8
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = !std::is_same_v<scalar_t, c10::qint8>;
+
+  GPU_LAMBDA float operator()(scalar_t value, float scale, float zero_point) const {
+    return (static_cast<float>(value.val_) - zero_point) * scale;
+  }
+};
+
 void quantize_tensor_per_tensor_affine_cuda(
     const Tensor& rtensor,
     Tensor& qtensor,
@@ -77,9 +106,7 @@ void dequantize_tensor_per_tensor_affine_cuda(
                         .add_output(rtensor)
                         .add_input(qtensor)
                         .build();
-        gpu_kernel(iter, [=] GPU_LAMBDA(scalar_t value) -> float {
-          return (static_cast<float>(value.val_) - zero_point) * scale;
-        });
+        gpu_kernel(iter, DequantizePerTensorFunctor<scalar_t>(scale, zero_point));
       });
 }
 
@@ -237,12 +264,7 @@ void dequantize_tensor_per_channel_float_qparams_cuda(
                         .add_input(shaped_zero_points)
                         .build();
 
-        gpu_kernel(
-            iter,
-            [=] GPU_LAMBDA(
-                scalar_t value, float scale, float zero_point) -> float {
-              return (static_cast<float>(value.val_) - zero_point) * scale;
-            });
+        gpu_kernel(iter, DequantizePerChannelFloatQParamsFunctor<scalar_t>());
       });
 }
 

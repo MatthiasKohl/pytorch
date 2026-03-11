@@ -20,16 +20,151 @@
 
 namespace at::native {
 
+struct BitwiseNotBoolFunctor {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
+  GPU_LAMBDA bool operator()(bool a) const { return !a; }
+};
+
+template <typename scalar_t>
+struct BitwiseNotFunctor {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a) const { return ~a; }
+};
+
+// We manually overload rsqrt because std::rsqrt does not work with complex types.
+template<typename scalar_t>
+C10_HOST_DEVICE static inline scalar_t rsqrt_wrapper(scalar_t v) {
+  return ::rsqrt(v);
+}
+
+template<typename T>
+C10_HOST_DEVICE static inline c10::complex<T> rsqrt_wrapper(c10::complex<T> v) {
+  const c10::complex<T> one = c10::complex<T>(1.0, 0);
+  // std::sqrt for c10::complex is overloaded in c10/util/complex_math.h
+  return one / ::sqrt(v);
+}
+
+template <typename scalar_t>
+struct RsqrtFunctor {
+  // only simple cases are half and bf16 except SM 75-
+  template <int cc_major, int /*cc_minor*/>
+  static constexpr bool is_simple = (
+    (std::is_same_v<scalar_t, c10::BFloat16> && cc_major >= 8) ||
+    (std::is_same_v<scalar_t, at::Half>));
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a) const {
+    // In CUDA, ::rsqrt is overloaded for float and at::Half here is implicitly cast to float.
+    // note(mjoux): I highly doubt the above note is correct.
+    return rsqrt_wrapper(a);
+  }
+};
+
+template <typename scalar_t>
+struct ClampFunctor {
+  // only simple cases are float, short, int and signed char
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = (
+    std::is_same_v<scalar_t, float> ||
+    std::is_same_v<scalar_t, short> ||
+    std::is_same_v<scalar_t, int> ||
+    std::is_same_v<scalar_t, signed char>);
+
+  GPU_LAMBDA scalar_t operator()(scalar_t v) const {
+    if (_isnan(v)) {
+      return v;
+    } else {
+      return ::min(::max(v, lower), upper);
+    }
+  }
+  ClampFunctor(scalar_t lower_, scalar_t upper_) : lower(lower_), upper(upper_) {}
+  private:
+  scalar_t lower;
+  scalar_t upper;
+};
+
+template <typename scalar_t>
+struct ClampMinFunctor {
+  // only non-simple cases are bf16 in SM 75-, double
+  template <int cc_major, int /*cc_minor*/>
+  static constexpr bool is_simple = !(
+    (std::is_same_v<scalar_t, c10::BFloat16> && cc_major < 8) ||
+    (std::is_same_v<scalar_t, double>));
+
+  GPU_LAMBDA scalar_t operator()(scalar_t v) const {
+    // Propagate nan, which doesn't propagate automatically for ROCm
+    if (_isnan(v)) {
+      return v;
+    } else {
+      return ::max(v, lower);
+    }
+  }
+  ClampMinFunctor(scalar_t lower_) : lower(lower_) {}
+  private:
+  scalar_t lower;
+};
+
+template <typename scalar_t>
+struct ClampMaxFunctor {
+  // only non-simple cases are bf16 in SM 75-, double
+  template <int cc_major, int /*cc_minor*/>
+  static constexpr bool is_simple = !(
+    (std::is_same_v<scalar_t, c10::BFloat16> && cc_major < 8) ||
+    (std::is_same_v<scalar_t, double>));
+
+  GPU_LAMBDA scalar_t operator()(scalar_t v) const {
+    // Propagate nan, which doesn't propagate automatically for ROCm
+    if (_isnan(v)) {
+      return v;
+    } else {
+      return ::min(v, upper);
+    }
+  }
+  ClampMaxFunctor(scalar_t upper_) : upper(upper_) {}
+  private:
+  scalar_t upper;
+};
+
+template<typename scalar_t>
+C10_HOST_DEVICE static inline scalar_t _nan_to_num_replace(scalar_t a, scalar_t nan_replacement, scalar_t pos_inf_replacement, scalar_t neg_inf_replacement) {
+  return at::_isnan(a)
+    ? nan_replacement
+    : (a == std::numeric_limits<scalar_t>::infinity()
+      ? pos_inf_replacement
+      : (a == -std::numeric_limits<scalar_t>::infinity()
+        ? neg_inf_replacement
+        : a));
+}
+
+template <typename scalar_t>
+struct NanToNumFunctor {
+  // only float is simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = std::is_same_v<scalar_t, float>;
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a) const {
+    return _nan_to_num_replace(
+      a, nan_replacement, pos_inf_replacement, neg_inf_replacement);
+  }
+  NanToNumFunctor(scalar_t nan_r, scalar_t pos_r, scalar_t neg_r)
+    : nan_replacement(nan_r), pos_inf_replacement(pos_r), neg_inf_replacement(neg_r) {}
+  private:
+  scalar_t nan_replacement;
+  scalar_t pos_inf_replacement;
+  scalar_t neg_inf_replacement;
+};
+
 void bitwise_not_kernel_cuda(TensorIteratorBase& iter) {
   if (iter.dtype() == ScalarType::Bool) {
-    gpu_kernel(iter, []GPU_LAMBDA(bool a) {
-      return !a;
-    });
+    gpu_kernel(iter, BitwiseNotBoolFunctor());
   } else {
     AT_DISPATCH_INTEGRAL_TYPES(iter.dtype(), "bitwise_not_cuda", [&]() {
-      gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> scalar_t {
-        return ~a;
-      });
+      gpu_kernel(iter, BitwiseNotFunctor<scalar_t>());
     });
   }
 }
@@ -79,19 +214,6 @@ void expm1_kernel_cuda(TensorIteratorBase& iter) {
       });
 }
 
-// We manually overload rsqrt because std::rsqrt does not work with complex types.
-template<typename scalar_t>
-C10_HOST_DEVICE static inline scalar_t rsqrt_wrapper(scalar_t v) {
-  return ::rsqrt(v);
-}
-
-template<typename T>
-C10_HOST_DEVICE static inline c10::complex<T> rsqrt_wrapper(c10::complex<T> v) {
-  const c10::complex<T> one = c10::complex<T>(1.0, 0);
-  // std::sqrt for c10::complex is overloaded in c10/util/complex_math.h
-  return one / ::sqrt(v);
-}
-
 constexpr char rsqrt_name[] = "rsqrt_kernel";
 void rsqrt_kernel_cuda(TensorIteratorBase& iter) {
   auto common_dtype = iter.common_dtype();
@@ -123,10 +245,7 @@ void rsqrt_kernel_cuda(TensorIteratorBase& iter) {
       ScalarType::BFloat16, ScalarType::Half,
       iter.common_dtype(), "rsqrt_cuda",
       [&]() {
-        gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> scalar_t {
-          // In CUDA, ::rsqrt is overloaded for float and at::Half here is implicitly cast to float.
-          return rsqrt_wrapper(a);
-        });
+        gpu_kernel(iter, RsqrtFunctor<scalar_t>());
       });
   }
 }
@@ -169,54 +288,22 @@ void clamp_kernel_cuda(TensorIteratorBase& iter, const Scalar& min_value, const 
   AT_DISPATCH_ALL_TYPES_AND2(kHalf, kBFloat16, iter.dtype(), "clamp_cuda", [&]() {
     auto lower = min_value.to<scalar_t>();
     auto upper = max_value.to<scalar_t>();
-    gpu_kernel(iter, [=]GPU_LAMBDA(scalar_t v) -> scalar_t {
-      // Propagate nan, which doesn't propagate automatically for ROCm
-      if (_isnan(v)) {
-        return v;
-      } else {
-        return ::min(::max(v, lower), upper);
-      }
-    });
+    gpu_kernel(iter, ClampFunctor<scalar_t>(lower, upper));
   });
 }
 
 void clamp_min_kernel_cuda(TensorIteratorBase& iter, const Scalar& min_value) {
   AT_DISPATCH_ALL_TYPES_AND2(kHalf, kBFloat16, iter.dtype(), "clamp_min_cuda", [&]() {
     auto lower = min_value.to<scalar_t>();
-    gpu_kernel(iter, [=]GPU_LAMBDA(scalar_t v) -> scalar_t {
-      // Propagate nan, which doesn't propagate automatically for ROCm
-      if (_isnan(v)) {
-        return v;
-      } else {
-        return ::max(v, lower);
-      }
-    });
+    gpu_kernel(iter, ClampMinFunctor<scalar_t>(lower));
   });
 }
 
 void clamp_max_kernel_cuda(TensorIteratorBase& iter, const Scalar& max_value) {
   AT_DISPATCH_ALL_TYPES_AND2(kHalf, kBFloat16, iter.dtype(), "clamp_max_cuda", [&]() {
     auto upper = max_value.to<scalar_t>();
-    gpu_kernel(iter, [=]GPU_LAMBDA(scalar_t v) -> scalar_t {
-      // Propagate nan, which doesn't propagate automatically for ROCm
-      if (_isnan(v)) {
-        return v;
-      } else {
-        return ::min(v, upper);
-      }
-    });
+    gpu_kernel(iter, ClampMaxFunctor<scalar_t>(upper));
   });
-}
-
-template<typename scalar_t>
-C10_HOST_DEVICE static inline scalar_t _nan_to_num_replace(scalar_t a, scalar_t nan_replacement, scalar_t pos_inf_replacement, scalar_t neg_inf_replacement) {
-  return at::_isnan(a)
-    ? nan_replacement
-    : (a == std::numeric_limits<scalar_t>::infinity()
-      ? pos_inf_replacement
-      : (a == -std::numeric_limits<scalar_t>::infinity()
-        ? neg_inf_replacement
-        : a));
 }
 
 void nan_to_num_kernel_cuda(
@@ -253,10 +340,8 @@ void nan_to_num_kernel_cuda(
           ? static_cast<scalar_t>(neg_inf.value())
           : std::numeric_limits<scalar_t>::lowest();
 
-      gpu_kernel(iter, [=] GPU_LAMBDA(scalar_t a) -> scalar_t {
-          return _nan_to_num_replace(
-            a, nan_replacement, pos_inf_replacement, neg_inf_replacement);
-      });
+      gpu_kernel(iter, NanToNumFunctor<scalar_t>(
+          nan_replacement, pos_inf_replacement, neg_inf_replacement));
     });
   }
 }

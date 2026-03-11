@@ -402,6 +402,24 @@ __global__ void masked_scatter_size_check(
 
 } // anonymous namespace
 
+template <typename scalar_t>
+struct MaskedScatterFunctor {
+  // only complex double is non-simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = !(
+    std::is_same_v<scalar_t, c10::complex<double>>);
+
+  GPU_LAMBDA scalar_t operator()(const scalar_t a, const bool mask, const int64_t maskPrefixSum) const {
+    if (mask) {
+      return source_ptr[maskPrefixSum];
+    }
+    return a;
+  }
+  MaskedScatterFunctor(const scalar_t* source_ptr_) : source_ptr(source_ptr_) {}
+  private:
+  const scalar_t* source_ptr;
+};
+
 void launch_masked_scatter_kernel(
     const TensorBase &self, const TensorBase &mask,
     const TensorBase &maskPrefixSum, const TensorBase &source) {
@@ -444,13 +462,7 @@ void launch_masked_scatter_kernel(
       "masked_scatter_",
       [&]() {
         auto source_ptr = source_contig.const_data_ptr<scalar_t>();
-        gpu_kernel(
-            iter, [=] GPU_LAMBDA(const scalar_t a, const bool mask, const int64_t maskPrefixSum) -> scalar_t {
-              if (mask) {
-                return source_ptr[maskPrefixSum];
-              }
-              return a;
-            });
+        gpu_kernel(iter, MaskedScatterFunctor<scalar_t>(source_ptr));
         AT_CUDA_CHECK(cudaGetLastError());
       });
 }

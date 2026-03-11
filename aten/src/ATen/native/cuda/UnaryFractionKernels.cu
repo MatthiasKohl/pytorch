@@ -21,14 +21,37 @@ __host__ __device__ static inline std::complex<T> ceil_wrapper(std::complex<T> v
   return std::complex<T>(std::ceil(v.real()), std::ceil(v.imag()));
 }
 
+template <typename scalar_t>
+struct CeilFunctor {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a) const {
+    return ceil_wrapper(a);
+  }
+};
+
+template <typename scalar_t>
+struct FracFunctor {
+  // only non-simple cases are bf16 in SM 75-, double with SM 10.3 / 11.x / 12.x,
+  template <int cc_major, int cc_minor>
+  static constexpr bool is_simple = !(
+    (std::is_same_v<scalar_t, c10::BFloat16> && cc_major < 8) ||
+    (std::is_same_v<scalar_t, double> && (
+      (cc_major >= 10 && cc_minor == 3) || cc_major == 11 || cc_major == 12)));
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a) const {
+    return a - ::trunc(a);
+  }
+};
+
 void ceil_kernel_cuda(TensorIteratorBase& iter) {
   AT_DISPATCH_FLOATING_TYPES_AND2(
       ScalarType::Half, ScalarType::BFloat16,
       iter.dtype(), "ceil_cuda",
       [&]() {
-        gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> scalar_t {
-          return ceil_wrapper(a);
-        });
+        gpu_kernel(iter, CeilFunctor<scalar_t>());
       });
 }
 
@@ -37,9 +60,7 @@ void frac_kernel_cuda(TensorIteratorBase& iter) {
       ScalarType::Half, ScalarType::BFloat16,
       iter.dtype(), "frac_cuda",
       [&]() {
-        gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> scalar_t {
-          return a - ::trunc(a);
-        });
+        gpu_kernel(iter, FracFunctor<scalar_t>());
       });
 }
 
@@ -54,14 +75,23 @@ __host__ __device__ static inline std::complex<T> floor_wrapper(std::complex<T> 
   return std::complex<T>(std::floor(v.real()), std::floor(v.imag()));
 }
 
+template <typename scalar_t>
+struct FloorFunctor {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a) const {
+    return floor_wrapper(a);
+  }
+};
+
 void floor_kernel_cuda(TensorIteratorBase& iter) {
   AT_DISPATCH_FLOATING_TYPES_AND2(
       ScalarType::Half, ScalarType::BFloat16,
       iter.dtype(), "floor_cuda",
       [&]() {
-        gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> scalar_t {
-          return floor_wrapper(a);
-        });
+        gpu_kernel(iter, FloorFunctor<scalar_t>());
       });
 }
 
@@ -128,15 +158,23 @@ __host__ __device__ static inline c10::complex<double> nearbyint_wrapper(c10::co
 }
 #pragma pop
 
+template <typename scalar_t>
+struct RoundFunctor {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a) const {
+    return nearbyint_wrapper(a);
+  }
+};
+
 void round_kernel_cuda(TensorIteratorBase& iter) {
   AT_DISPATCH_FLOATING_TYPES_AND2(
       ScalarType::Half, ScalarType::BFloat16,
       iter.dtype(), "round_cuda",
       [&]() {
-        gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> scalar_t {
-          // We do not use std::round because we would like to round midway numbers to the nearest even integer.
-          return nearbyint_wrapper(a);
-        });
+        gpu_kernel(iter, RoundFunctor<scalar_t>());
       });
 }
 
@@ -177,14 +215,24 @@ __host__ __device__ static inline c10::complex<double> trunc_wrapper(c10::comple
   return c10::complex<double>(::trunc(static_cast<double>(a.real())), ::trunc(static_cast<double>(a.imag())));
 }
 
+template <typename scalar_t>
+struct TruncFunctor {
+  // only non-simple is double
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = !(std::is_same_v<scalar_t, double>);
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a) const {
+    return trunc_wrapper(a);
+  }
+};
+
+
 void trunc_kernel_cuda(TensorIteratorBase& iter) {
   AT_DISPATCH_FLOATING_TYPES_AND2(
       ScalarType::Half, ScalarType::BFloat16,
       iter.dtype(), "trunc_cuda",
       [&]() {
-        gpu_kernel(iter, []GPU_LAMBDA(scalar_t a) -> scalar_t {
-          return trunc_wrapper(a);
-        });
+        gpu_kernel(iter, TruncFunctor<scalar_t>());
       });
 }
 

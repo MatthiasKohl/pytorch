@@ -12,6 +12,34 @@
 
 namespace at::native {
 
+template <typename scalar_t>
+struct HuberFunctor {
+  // only float is simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = std::is_same_v<scalar_t, float>;
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a, scalar_t b) const {
+    auto z = ::abs(a - b);
+    return z < delta_val ? scalar_t(0.5) * z * z : delta_val * (z - scalar_t(0.5) * delta_val);
+  }
+  HuberFunctor(scalar_t delta_val_) : delta_val(delta_val_) {}
+  private:
+  scalar_t delta_val;
+};
+
+template <typename scalar_t>
+struct MseFunctor {
+  // always simple except for bf16 for SM 75-
+  template <int cc_major, int /*cc_minor*/>
+  static constexpr bool is_simple =
+    !(cc_major < 8 && std::is_same_v<scalar_t, c10::BFloat16>);
+
+  GPU_LAMBDA scalar_t operator()(scalar_t a, scalar_t b) const {
+    auto diff = a - b;
+    return diff * diff;
+  }
+};
+
 void smooth_l1_kernel_cuda(TensorIteratorBase& iter, double beta) {
   AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, iter.dtype(), "smooth_l1_cuda", [&iter, beta]() {
     scalar_t beta_val(beta);
@@ -24,20 +52,13 @@ void smooth_l1_kernel_cuda(TensorIteratorBase& iter, double beta) {
 
 void huber_kernel_cuda(TensorIterator& iter, double delta) {
   AT_DISPATCH_FLOATING_TYPES_AND2(kBFloat16, kHalf, iter.dtype(), "huber_cuda", [&iter, delta] {
-    scalar_t delta_val(delta);
-    gpu_kernel(iter, [delta_val] GPU_LAMBDA (scalar_t a, scalar_t b) -> scalar_t {
-      auto z = ::abs(a - b);
-      return z < delta_val ? scalar_t(0.5) * z * z : delta_val * (z - scalar_t(0.5) * delta_val);
-    });
+    gpu_kernel(iter, HuberFunctor<scalar_t>(scalar_t(delta)));
   });
 }
 
 void mse_kernel_cuda(TensorIteratorBase& iter) {
   AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, iter.dtype(), "mse_cuda", [&]() {
-    gpu_kernel(iter, []GPU_LAMBDA(scalar_t a, scalar_t b) -> scalar_t {
-      auto diff = a - b;
-      return diff * diff;
-    });
+    gpu_kernel(iter, MseFunctor<scalar_t>());
   });
 }
 

@@ -7,6 +7,34 @@
 #include <ATen/OpMathType.h>
 
 namespace at::native {
+
+template <typename scalar_t, typename opmath_t>
+struct LerpScalarFunctor {
+  // only non-simple cases is double and bf16 with SM 75-
+  template <int cc_major, int /*cc_minor*/>
+  static constexpr bool is_simple = !(
+    std::is_same_v<scalar_t, double> ||
+    (std::is_same_v<scalar_t, c10::BFloat16> && cc_major < 8));
+
+  GPU_LAMBDA scalar_t operator()(scalar_t self_val, scalar_t end_val) const {
+    return lerp(self_val, end_val, weight_val);
+  }
+  LerpScalarFunctor(opmath_t weight_val_) : weight_val(weight_val_) {}
+  private:
+  opmath_t weight_val;
+};
+
+template <typename scalar_t>
+struct LerpFunctor {
+  // only simple case is float
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = std::is_same_v<scalar_t, float>;
+
+  GPU_LAMBDA scalar_t operator()(scalar_t self_val, scalar_t end_val, scalar_t weight_val) const {
+    return lerp(self_val, end_val, weight_val);
+  }
+};
+
 namespace {
 
 void lerp_scalar_kernel(
@@ -74,13 +102,7 @@ void lerp_tensor_kernel(at::TensorIteratorBase& iter) {
         }
 
         at::native::gpu_kernel(
-          iter,
-          [] GPU_LAMBDA(
-              scalar_t self_val,
-              scalar_t end_val,
-              scalar_t weight_val) -> scalar_t {
-            return lerp(self_val, end_val, weight_val);
-          });
+          iter, LerpFunctor<scalar_t>());
       });
   }
 }
@@ -132,11 +154,7 @@ void lerp_scalar_kernel(at::TensorIteratorBase& iter, const c10::Scalar& weight)
       dtype, "lerp_cuda",
       [&]{
         using opmath_t = at::opmath_type<scalar_t>;
-        auto weight_val = weight.to<opmath_t>();
-        at::native::gpu_kernel(
-            iter, [=] GPU_LAMBDA(scalar_t self_val, scalar_t end_val) {
-              return lerp(self_val, end_val, weight_val);
-            });
+        at::native::gpu_kernel(iter, LerpScalarFunctor<scalar_t, opmath_t>(weight.to<opmath_t>()));
       });
     }
 }

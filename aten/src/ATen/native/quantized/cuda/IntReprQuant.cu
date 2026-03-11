@@ -14,6 +14,17 @@
 
 namespace at::native {
 
+template <typename scalar_t, typename underlying_t>
+struct IntReprFunctor {
+  // always simple
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
+  GPU_LAMBDA underlying_t operator()(scalar_t value) const {
+    return value.val_;
+  }
+};
+
 Tensor int_repr_quantized_cuda(const Tensor& self) {
   Tensor dst;
   AT_DISPATCH_QINT_TYPES(self.scalar_type(), "int_repr_quantized_cuda", [&]() {
@@ -26,9 +37,7 @@ Tensor int_repr_quantized_cuda(const Tensor& self) {
       .add_output(dst)
       .add_input(self)
       .build();
-    gpu_kernel(iter, [] GPU_LAMBDA(scalar_t value) -> underlying_t {
-      return value.val_;
-    });
+    gpu_kernel(iter, IntReprFunctor<scalar_t, underlying_t>());
   });
   return dst;
 }

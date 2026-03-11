@@ -126,8 +126,28 @@ void gpu_kernel(TensorIteratorBase& iter, const func_t& f) {
   gpu_kernel_impl(iter, f);
 }
 
+enum class FunctorType : int {
+  AUnary = 0,
+  BUnary = 1,
+  Binary = 2,
+};
+
+template <typename func_t, int cc_major, int cc_minor, FunctorType functor_type, typename = void>
+struct get_is_simple_with_scalars : get_is_simple<func_t, cc_major, cc_minor> {};
+
+template <typename func_t, int cc_major, int cc_minor, FunctorType functor_type>
+struct get_is_simple_with_scalars<func_t, cc_major, cc_minor, functor_type, std::void_t<
+      decltype(func_t::template is_simple<cc_major, cc_minor, functor_type>)>
+    > {
+  static constexpr bool value = func_t::template is_simple<cc_major, cc_minor, functor_type>;
+};
+
 template<typename arg1_t, typename arg2_t, typename return_t, typename func_t>
 struct AUnaryFunctor {
+  template <int cc_major, int cc_minor>
+  static constexpr bool is_simple = get_is_simple_with_scalars<
+    func_t, cc_major, cc_minor, FunctorType::AUnary>::value;
+
   using traits = function_traits<func_t>;
   using opmath_arg1_t = typename traits::template arg<0>::type;
   __device__ return_t operator()(arg2_t b) const {
@@ -142,6 +162,10 @@ struct AUnaryFunctor {
 
 template<typename arg1_t, typename arg2_t, typename return_t, typename func_t>
 struct BUnaryFunctor {
+  template <int cc_major, int cc_minor>
+  static constexpr bool is_simple = get_is_simple_with_scalars<
+    func_t, cc_major, cc_minor, FunctorType::BUnary>::value;
+
   using traits = function_traits<func_t>;
   using opmath_arg2_t = typename traits::template arg<1>::type;
   __device__ return_t operator()(arg1_t a) const {
@@ -158,6 +182,10 @@ struct BUnaryFunctor {
 // (which may be higher precision), as well as casts to return_t
 template <typename arg1_t, typename arg2_t, typename return_t, typename func_t>
 struct BinaryFunctor {
+  template <int cc_major, int cc_minor>
+  static constexpr bool is_simple = get_is_simple_with_scalars<
+    func_t, cc_major, cc_minor, FunctorType::Binary>::value;
+
   __device__ return_t operator()(arg1_t a, arg2_t b) const {
     return f(a, b);
   }

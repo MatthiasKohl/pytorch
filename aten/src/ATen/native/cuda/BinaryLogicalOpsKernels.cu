@@ -11,6 +11,51 @@
 
 namespace at::native {
 
+template <typename scalar_t>
+struct LogicalAndFunctor {
+  // only non-simple are: complex<double>, complex<float> with binary functor,
+  // and double with binary functor.
+  template <int /*cc_major*/, int /*cc_minor*/, FunctorType functor_type>
+  static constexpr bool is_simple =
+    !(std::is_same_v<scalar_t, c10::complex<double>> ||
+      (std::is_same_v<scalar_t, c10::complex<float>> && functor_type == FunctorType::Binary) ||
+      (std::is_same_v<scalar_t, double> && functor_type == FunctorType::Binary));
+
+  GPU_LAMBDA bool operator()(scalar_t a, scalar_t b) const {
+    return a && b;
+  }
+};
+
+template <typename scalar_t>
+struct LogicalOrFunctor {
+  // only non-simple are: complex<double>, complex<float> with binary functor,
+  // and double with binary functor.
+  template <int /*cc_major*/, int /*cc_minor*/, FunctorType functor_type>
+  static constexpr bool is_simple = 
+  !(std::is_same_v<scalar_t, c10::complex<double>> ||
+    (std::is_same_v<scalar_t, c10::complex<float>> && functor_type == FunctorType::Binary) ||
+    (std::is_same_v<scalar_t, double> && functor_type == FunctorType::Binary));
+
+  GPU_LAMBDA bool operator()(scalar_t a, scalar_t b) const {
+    return a || b;
+  }
+};
+
+template <typename scalar_t>
+struct LogicalXorFunctor {
+  // only non-simple are: complex<double>, complex<float> with binary functor,
+  // and double with binary functor.
+  template <int /*cc_major*/, int /*cc_minor*/, FunctorType functor_type>
+  static constexpr bool is_simple =
+    !(std::is_same_v<scalar_t, c10::complex<double>> ||
+      (std::is_same_v<scalar_t, c10::complex<float>> && functor_type == FunctorType::Binary) ||
+      (std::is_same_v<scalar_t, double> && functor_type == FunctorType::Binary));
+
+  GPU_LAMBDA bool operator()(scalar_t a, scalar_t b) const {
+    return bool(a) != bool(b);
+  }
+};
+
 constexpr char logical_and_name[] = "logical_and_kernel";
 void logical_and_kernel_cuda(TensorIterator& iter) {
   auto dtype = iter.common_dtype();
@@ -32,18 +77,14 @@ void logical_and_kernel_cuda(TensorIterator& iter) {
 #else
     AT_DISPATCH_COMPLEX_TYPES(dtype, "logical_and_cuda", [&]() {
       opmath_symmetric_gpu_kernel_with_scalars<scalar_t, bool>(
-          iter, []GPU_LAMBDA(scalar_t a, scalar_t b) -> bool {
-        return a && b;
-      });
+          iter, LogicalAndFunctor<scalar_t>());
     });
 #endif
   } else {
     AT_DISPATCH_ALL_TYPES_AND3(kHalf, kBool, ScalarType::BFloat16,
                                dtype, "logical_and_cuda", [&]() {
       opmath_symmetric_gpu_kernel_with_scalars<scalar_t, bool>(
-          iter, []GPU_LAMBDA(scalar_t a, scalar_t b) -> bool {
-        return a && b;
-      });
+          iter, LogicalAndFunctor<scalar_t>());
    });
   }
 }
@@ -68,18 +109,14 @@ void logical_or_kernel_cuda(TensorIterator& iter) {
     });
 #else
     AT_DISPATCH_COMPLEX_TYPES(dtype, "logical_or_cuda", [&]() {
-      gpu_kernel_with_scalars(iter, []GPU_LAMBDA(scalar_t a, scalar_t b) -> bool {
-        return a || b;
-      });
+      gpu_kernel_with_scalars(iter, LogicalOrFunctor<scalar_t>());
     });
 #endif
   } else {
   AT_DISPATCH_ALL_TYPES_AND3(kHalf, kBool, ScalarType::BFloat16,
                              dtype, "logical_or_cuda", [&]() {
     opmath_symmetric_gpu_kernel_with_scalars<scalar_t, bool>(
-        iter, []GPU_LAMBDA(scalar_t a, scalar_t b) -> bool {
-      return a || b;
-    });
+        iter, LogicalOrFunctor<scalar_t>());
   });
   }
 }
@@ -104,18 +141,14 @@ void logical_xor_kernel_cuda(TensorIterator& iter) {
     }); // logical_xor_string
 #else
     AT_DISPATCH_COMPLEX_TYPES(dtype, "logical_xor_cuda", [&]() {
-      gpu_kernel_with_scalars(iter, []GPU_LAMBDA(scalar_t a, scalar_t b) -> bool {
-        return bool(a) != bool(b);
-      });
+      gpu_kernel_with_scalars(iter, LogicalXorFunctor<scalar_t>());
     });
 #endif
   } else {
   AT_DISPATCH_ALL_TYPES_AND3(kHalf, kBool, ScalarType::BFloat16,
                              dtype, "logical_xor_cuda", [&]() {
     opmath_symmetric_gpu_kernel_with_scalars<scalar_t, bool>(
-        iter, []GPU_LAMBDA(scalar_t a, scalar_t b) -> bool {
-      return bool(a) != bool(b);
-    });
+        iter, LogicalXorFunctor<scalar_t>());
   });
   }
 }

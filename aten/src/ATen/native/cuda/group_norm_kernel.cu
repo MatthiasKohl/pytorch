@@ -475,6 +475,121 @@ __global__ void GammaBetaBackwardCUDAKernel2(
 }
 
 template <typename T>
+struct GroupNorm1dForwardGammaBetaFunctor {
+  // only simple case is float
+  using T_ACC = acc_type<T, true>;
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = std::is_same_v<T, float>;
+
+  GPU_LAMBDA T operator()(T x, T mean, T rstd, T gamma, T beta) const {
+    return (static_cast<T_ACC>(x) - static_cast<T_ACC>(mean)) *
+        static_cast<T_ACC>(rstd) * static_cast<T_ACC>(gamma) +
+        static_cast<T_ACC>(beta);
+  }
+};
+
+template <typename T>
+struct GroupNorm1dForwardGammaFunctor {
+  // only simple cases are float and double except SM 10.3 / 11.0 / 12.0
+  using T_ACC = acc_type<T, true>;
+  template <int cc_major, int cc_minor>
+  static constexpr bool is_simple = (
+    std::is_same_v<T, float> ||
+    (std::is_same_v<T, double> && !(
+      (cc_major == 10 && cc_minor == 3) || cc_major == 11 || cc_major == 12)));
+ 
+  GPU_LAMBDA T operator()(T x, T mean, T rstd, T gamma) const {
+    return (static_cast<T_ACC>(x) - static_cast<T_ACC>(mean)) *
+        static_cast<T_ACC>(rstd) * static_cast<T_ACC>(gamma);
+  }
+};
+
+template <typename T>
+struct GroupNorm1dForwardBetaFunctor {
+  // only simple cases are float and double except SM 10.3 / 11.x / 12.x
+  using T_ACC = acc_type<T, true>;
+  template <int cc_major, int cc_minor>
+  static constexpr bool is_simple = (
+    std::is_same_v<T, float> ||
+    (std::is_same_v<T, double> && !(
+      (cc_major == 10 && cc_minor == 3) || cc_major == 11 || cc_major == 12)));
+
+  GPU_LAMBDA T operator()(T x, T mean, T rstd, T beta) const {
+    return (static_cast<T_ACC>(x) - static_cast<T_ACC>(mean)) *
+        static_cast<T_ACC>(rstd) +
+        static_cast<T_ACC>(beta);
+  }
+};
+
+template <typename T>
+struct GroupNormForwardSimpleFunctor {
+  // only non-simple cases are bf16 for SM 75- and double for SM 10.3 / 11.x / 12.x
+  using T_ACC = acc_type<T, true>;
+  template <int cc_major, int cc_minor>
+  static constexpr bool is_simple = !(
+    (std::is_same_v<T, c10::BFloat16> && cc_major < 8) ||
+    (std::is_same_v<T, double> && (
+      (cc_major == 10 && cc_minor == 3) || cc_major == 11 || cc_major == 12)));
+
+  GPU_LAMBDA T operator()(T x, T mean, T rstd) const {
+    return (static_cast<T_ACC>(x) - static_cast<T_ACC>(mean)) *
+        static_cast<T_ACC>(rstd);
+  }
+};
+
+template <typename T>
+struct GroupNormForwardFusedFunctor {
+  // only non-simple case is bf16 for SM 75-
+  using T_ACC = acc_type<T, true>;
+  template <int cc_major, int /*cc_minor*/>
+  static constexpr bool is_simple = !(
+    (std::is_same_v<T, c10::BFloat16> && cc_major < 8));
+
+  GPU_LAMBDA T operator()(T x, T_ACC a, T_ACC b) const {
+    return a * static_cast<T_ACC>(x) + b;
+  }
+};
+
+template <typename T>
+struct GroupNorm1dBackwardDxFunctor {
+  // only simple case is float
+  using T_ACC = acc_type<T, true>;
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = std::is_same_v<T, float>;
+
+  GPU_LAMBDA T operator()(T dy, T x, T rstd, T_ACC c2, T_ACC c3) const {
+    const T_ACC c1 = static_cast<T_ACC>(rstd);
+    return c1 * static_cast<T_ACC>(dy) + c2 * static_cast<T_ACC>(x) +
+        c3;
+  }
+};
+
+template <typename T>
+struct GroupNormBackwardC1Functor {
+  // always simple
+  using T_ACC = acc_type<T, true>;
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = true;
+
+  GPU_LAMBDA T_ACC operator()(T rstd, T gamma) const {
+    return static_cast<T_ACC>(rstd) * static_cast<T_ACC>(gamma);
+  }
+};
+
+template <typename T>
+struct GroupNormBackwardDxFunctor {
+  // only simple case is float
+  using T_ACC = acc_type<T, true>;
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple = std::is_same_v<T, float>;
+
+  GPU_LAMBDA T operator()(T dy, T x, T_ACC c1, T_ACC c2, T_ACC c3) const {
+    return c1 * static_cast<T_ACC>(dy) + c2 * static_cast<T_ACC>(x) +
+        c3;
+  }
+};
+
+template <typename T>
 void GroupNorm1dForward(
     const Tensor& X,
     const Tensor& mean,
@@ -498,11 +613,7 @@ void GroupNorm1dForward(
                     .add_owned_const_input(gamma.view({1, G, D}))
                     .add_owned_const_input(beta.view({1, G, D}))
                     .build();
-    gpu_kernel(iter, [] GPU_LAMBDA(T x, T mean, T rstd, T gamma, T beta) -> T {
-      return (static_cast<T_ACC>(x) - static_cast<T_ACC>(mean)) *
-          static_cast<T_ACC>(rstd) * static_cast<T_ACC>(gamma) +
-          static_cast<T_ACC>(beta);
-    });
+    gpu_kernel(iter, GroupNorm1dForwardGammaBetaFunctor<T>());
   } else if (gamma.defined()) {
     auto iter = TensorIteratorConfig()
                     .resize_outputs(false)
@@ -512,10 +623,7 @@ void GroupNorm1dForward(
                     .add_owned_input(rstd.view({N, G, 1}))
                     .add_owned_const_input(gamma.view({1, G, D}))
                     .build();
-    gpu_kernel(iter, [] GPU_LAMBDA(T x, T mean, T rstd, T gamma) -> T {
-      return (static_cast<T_ACC>(x) - static_cast<T_ACC>(mean)) *
-          static_cast<T_ACC>(rstd) * static_cast<T_ACC>(gamma);
-    });
+    gpu_kernel(iter, GroupNorm1dForwardGammaFunctor<T>());
   } else if (beta.defined()) {
     auto iter = TensorIteratorConfig()
                     .resize_outputs(false)
@@ -525,11 +633,7 @@ void GroupNorm1dForward(
                     .add_owned_input(rstd.view({N, G, 1}))
                     .add_owned_const_input(beta.view({1, G, D}))
                     .build();
-    gpu_kernel(iter, [] GPU_LAMBDA(T x, T mean, T rstd, T beta) -> T {
-      return (static_cast<T_ACC>(x) - static_cast<T_ACC>(mean)) *
-          static_cast<T_ACC>(rstd) +
-          static_cast<T_ACC>(beta);
-    });
+    gpu_kernel(iter, GroupNorm1dForwardBetaFunctor<T>());
   } else {
     auto iter = TensorIteratorConfig()
                     .resize_outputs(false)
@@ -538,10 +642,7 @@ void GroupNorm1dForward(
                     .add_owned_input(mean.view({N * G, 1}))
                     .add_owned_input(rstd.view({N * G, 1}))
                     .build();
-    gpu_kernel(iter, [] GPU_LAMBDA(T x, T mean, T rstd) -> T {
-      return (static_cast<T_ACC>(x) - static_cast<T_ACC>(mean)) *
-          static_cast<T_ACC>(rstd);
-    });
+    gpu_kernel(iter, GroupNormForwardSimpleFunctor<T>());
   }
   AT_CUDA_CHECK(cudaGetLastError());
 }
@@ -590,10 +691,7 @@ void GroupNormKernelImplInternal(
                     .add_owned_input(mean.view({N * G, 1}))
                     .add_owned_input(rstd.view({N * G, 1}))
                     .build();
-    gpu_kernel(iter, [] GPU_LAMBDA(T x, T mean, T rstd) -> T {
-      return (static_cast<T_ACC>(x) - static_cast<T_ACC>(mean)) *
-          static_cast<T_ACC>(rstd);
-    });
+    gpu_kernel(iter, GroupNormForwardSimpleFunctor<T>());
   } else {
     const auto kAccType =
         (X.scalar_type() == kHalf || X.scalar_type() == kBFloat16)
@@ -622,9 +720,7 @@ void GroupNormKernelImplInternal(
                     .add_owned_input(a.view({N * C, 1}))
                     .add_owned_input(b.view({N * C, 1}))
                     .build();
-    gpu_kernel(iter, [] GPU_LAMBDA(T x, T_ACC a, T_ACC b) -> T {
-      return a * static_cast<T_ACC>(x) + b;
-    });
+    gpu_kernel(iter, GroupNormForwardFusedFunctor<T>());
   }
   AT_CUDA_CHECK(cudaGetLastError());
 }
@@ -741,12 +837,7 @@ void GroupNorm1dBackward(
                       .add_owned_const_input(c2.view({N * G, 1}))
                       .add_owned_const_input(c3.view({N * G, 1}))
                       .build();
-      gpu_kernel(
-          iter, [] GPU_LAMBDA(T dy, T x, T rstd, T_ACC c2, T_ACC c3) -> T {
-            const T_ACC c1 = static_cast<T_ACC>(rstd);
-            return c1 * static_cast<T_ACC>(dy) + c2 * static_cast<T_ACC>(x) +
-                c3;
-          });
+      gpu_kernel(iter, GroupNorm1dBackwardDxFunctor<T>());
     }
   }
   if (dgamma.defined() || dbeta.defined()) {
@@ -864,9 +955,7 @@ void GroupNormBackwardKernelImplInternal(
                       .add_owned_const_input(rstd.view({N, G, 1}))
                       .add_owned_const_input(gamma.view({1, G, D}))
                       .build();
-      gpu_kernel(iter, [] GPU_LAMBDA(T rstd, T gamma) -> T_ACC {
-        return static_cast<T_ACC>(rstd) * static_cast<T_ACC>(gamma);
-      });
+      gpu_kernel(iter, GroupNormBackwardC1Functor<T>());
     }
 
     num_threads = (C / G) < cuda_utils::kCUDABlockReduceNumThreads
@@ -897,11 +986,7 @@ void GroupNormBackwardKernelImplInternal(
                       .add_owned_const_input(c2.view({N * G, 1, 1}))
                       .add_owned_const_input(c3.view({N * G, 1, 1}))
                       .build();
-      gpu_kernel(
-          iter, [] GPU_LAMBDA(T dy, T x, T_ACC c1, T_ACC c2, T_ACC c3) -> T {
-            return c1 * static_cast<T_ACC>(dy) + c2 * static_cast<T_ACC>(x) +
-                c3;
-          });
+      gpu_kernel(iter, GroupNormBackwardDxFunctor<T>());
     } else {
       auto iter = TensorIteratorConfig()
                       .check_all_same_dtype(std::is_same_v<T, T_ACC>)
@@ -913,11 +998,7 @@ void GroupNormBackwardKernelImplInternal(
                       .add_owned_const_input(c2.view({N * G, 1}))
                       .add_owned_const_input(c3.view({N * G, 1}))
                       .build();
-      gpu_kernel(
-          iter, [] GPU_LAMBDA(T dy, T x, T_ACC c1, T_ACC c2, T_ACC c3) -> T {
-            return c1 * static_cast<T_ACC>(dy) + c2 * static_cast<T_ACC>(x) +
-                c3;
-          });
+      gpu_kernel(iter, GroupNormBackwardDxFunctor<T>());
     }
   }
   if (dgamma.defined() || dbeta.defined()) {

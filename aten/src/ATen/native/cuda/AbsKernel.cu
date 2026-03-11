@@ -10,6 +10,15 @@ namespace at::native {
 
 template<typename scalar_t>
 struct AbsFunctor {
+  // only complex types are non-simple lambdas
+  // note: c10::Half is technically unnecessary here,
+  // but added in case opmath_type changes in the future.
+  template <int /*cc_major*/, int /*cc_minor*/>
+  static constexpr bool is_simple =
+    !(std::is_same_v<scalar_t, c10::complex<float>> ||
+    std::is_same_v<scalar_t, c10::complex<double>> ||
+    std::is_same_v<scalar_t, c10::complex<c10::Half>>);
+
   __device__ __forceinline__ scalar_t operator() (const scalar_t a) const {
     return std::abs(a);
   }
