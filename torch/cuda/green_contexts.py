@@ -2,6 +2,9 @@ from typing import Optional
 
 import torch
 
+__all__ = [
+    "GreenContext",
+]
 
 _GreenContext = object
 SUPPORTED = False

@@ -22,11 +22,11 @@ void THCPGreenContext_init(PyObject* module) {
             if (workqueue_scope.has_value()) {
               const auto& s = *workqueue_scope;
               if (s == "device_ctx") {
-                scope = static_cast<int32_t>(
-                  at::cuda::WorkqueueScope::DeviceCtx);
+                scope =
+                    static_cast<int32_t>(at::cuda::WorkqueueScope::DeviceCtx);
               } else if (s == "balanced") {
-                scope = static_cast<int32_t>(
-                  at::cuda::WorkqueueScope::Balanced);
+                scope =
+                    static_cast<int32_t>(at::cuda::WorkqueueScope::Balanced);
               } else {
                 throw std::invalid_argument(
                     "workqueue_scope must be 'device_ctx' or 'balanced', got '" +
