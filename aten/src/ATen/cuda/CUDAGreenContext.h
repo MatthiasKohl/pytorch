@@ -48,7 +48,7 @@ class TORCH_CUDA_CPP_API GreenContext {
     std::optional<uint32_t> num_sms,
     std::optional<int32_t> workqueue_scope,
     std::optional<uint32_t> workqueue_concurrency_limit);
-  
+
   // Implement move operations
   GreenContext(GreenContext&& other) noexcept;
   GreenContext& operator=(GreenContext&& other) noexcept;
