@@ -22,6 +22,7 @@ from torch.testing._internal.common_cuda import (
     blas_library_context,
     PLATFORM_SUPPORTS_BF16,
     PLATFORM_SUPPORTS_GREEN_CONTEXT,
+    PLATFORM_SUPPORTS_WORKQUEUE_CONFIG,
     SM80OrLater,
     SM90OrLater,
     SM100OrLater,
@@ -1009,7 +1010,7 @@ class TestMatmulCuda(InductorTestCase):
     @serialTest()
     def test_greencontext_carveout(self):
         a = torch.randn(4096, 4096, device='cuda', dtype=torch.bfloat16)
-        ctx = torch.cuda.green_contexts.GreenContext.create(1, 0)
+        ctx = torch.cuda.green_contexts.GreenContext.create(num_sms=1, device_id=0)
         ctx.set_context()
         torch.matmul(a, a)
         torch.cuda.synchronize()
@@ -1031,7 +1032,7 @@ class TestMatmulCuda(InductorTestCase):
     @serialTest()
     def test_greencontext_stream_carveout(self):
         a = torch.randn(4096, 4096, device='cuda', dtype=torch.bfloat16)
-        ctx = torch.cuda.green_contexts.GreenContext.create(1, 0)
+        ctx = torch.cuda.green_contexts.GreenContext.create(num_sms=1, device_id=0)
         ctx_stream = ctx.Stream()
         with torch.cuda.stream(ctx_stream):
             torch.matmul(a, a)
@@ -1053,7 +1054,7 @@ class TestMatmulCuda(InductorTestCase):
     @serialTest()
     def test_greencontext_graphs(self):
         a = torch.randn(4096, 4096, device='cuda', dtype=torch.bfloat16)
-        ctx = torch.cuda.green_contexts.GreenContext.create(1, 0)
+        ctx = torch.cuda.green_contexts.GreenContext.create(num_sms=1, device_id=0)
         ctx.set_context()
         partial_res = torch.matmul(a, a)
         ctx.pop_context()
@@ -1070,6 +1071,54 @@ class TestMatmulCuda(InductorTestCase):
             full_res = torch.matmul(a, a)
         g.replay()
         self.assertEqual(partial_res, full_res)
+
+    @unittest.skipIf(not PLATFORM_SUPPORTS_WORKQUEUE_CONFIG, "Workqueue config is not supported")
+    @serialTest()
+    def test_greencontext_workqueue_concurrency_limit(self):
+        GreenContext = torch.cuda.green_contexts.GreenContext
+        max_wq = GreenContext.max_workqueue_concurrency(device_id=0)
+        if max_wq <= 1:
+            self.skipTest(f"Device has {max_wq} workqueue(s), need >1 to test concurrency limiting")
+
+        n_streams = 8
+        inputs = [torch.randn(256, 256, device='cuda', dtype=torch.bfloat16) for _ in range(n_streams)]
+
+        def run_multi_stream_matmuls(streams):
+            results = [None] * n_streams
+            for i, s in enumerate(streams):
+                with torch.cuda.stream(s):
+                    results[i] = torch.matmul(inputs[i], inputs[i])
+            torch.cuda.synchronize()
+            return results
+
+        # Baseline: 8 streams from default context, full workqueue concurrency
+        baseline_streams = [torch.cuda.Stream() for _ in range(n_streams)]
+        run_multi_stream_matmuls(baseline_streams)  # warmup
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        baseline_results = run_multi_stream_matmuls(baseline_streams)
+        t1 = time.perf_counter()
+        baseline_time = t1 - t0
+
+        # Green context with workqueue concurrency limited to 1
+        ctx = GreenContext.create(
+            workqueue_scope="balanced",
+            workqueue_concurrency_limit=1,
+            device_id=0,
+        )
+        ctx.set_context()
+        green_streams = [ctx.Stream() for _ in range(n_streams)]
+        run_multi_stream_matmuls(green_streams)  # warmup
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        limited_results = run_multi_stream_matmuls(green_streams)
+        t3 = time.perf_counter()
+        ctx.pop_context()
+        limited_time = t3 - t2
+
+        for baseline_r, limited_r in zip(baseline_results, limited_results):
+            self.assertEqual(baseline_r, limited_r)
+        self.assertGreater(limited_time, baseline_time)
 
 
 @unittest.skipIf(TEST_WITH_ROCM, "ROCm doesn't support CUTLASS")

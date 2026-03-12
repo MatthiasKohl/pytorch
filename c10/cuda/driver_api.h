@@ -73,6 +73,7 @@
 #define C10_LIBCUDA_DRIVER_API_OPTIONAL(_) \
   _(cuCtxFromGreenCtx, 12080)              \
   _(cuCtxGetCurrent, 12080)                \
+  _(cuCtxGetDevResource, 12080)            \
   _(cuCtxPopCurrent, 12080)                \
   _(cuCtxPushCurrent, 12080)               \
   _(cuCtxSetCurrent, 12080)                \
