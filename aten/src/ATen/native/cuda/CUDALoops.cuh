@@ -243,9 +243,13 @@ struct TuningConstantsSelector {
     // the compiler will need to issue more and more instructions to comply with
     // register constraints. For non-simple lambdas, we thus limit unroll to 8.
     static constexpr int max_unroll = is_simple ? 32 : 8;
+    // TODO rubin with 96 bytes: (is_simple && !small_footprint ? 96 : 16)
+
     // note: in order to allow more flexibility for the compiler with register
     // constraints, we allow up to 2 unroll sequences per loaded set of registers.
     static constexpr int max_vectors_per_unroll = 2;
+    // TODO rubin with 96 bytes: (is_simple && !small_footprint ? 3 : 2)
+
     // for non-simple lambdas, we want to hide more latency even within a thread,
     // thus we split the load set into 2 instructions.
     static constexpr int max_bytes_per_load_inst =
