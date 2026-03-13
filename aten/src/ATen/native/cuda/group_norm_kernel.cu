@@ -497,7 +497,7 @@ struct GroupNorm1dForwardGammaFunctor {
     std::is_same_v<T, float> ||
     (std::is_same_v<T, double> && !(
       (cc_major == 10 && cc_minor == 3) || cc_major == 11 || cc_major == 12)));
- 
+
   GPU_LAMBDA T operator()(T x, T mean, T rstd, T gamma) const {
     return (static_cast<T_ACC>(x) - static_cast<T_ACC>(mean)) *
         static_cast<T_ACC>(rstd) * static_cast<T_ACC>(gamma);

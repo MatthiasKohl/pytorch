@@ -209,7 +209,9 @@ def compute_ufunc_cuda_functors(
         if ufunc_name == "add":
             # for addition, non-simple cases are complex double,
             # complex half (except CUDAFunctorOnSelf), and bf16 on sm 75
-            complex_half_cond = "std::is_same_v<scalar_t, c10::complex<c10::Half>> ||\n    "
+            complex_half_cond = (
+                "std::is_same_v<scalar_t, c10::complex<c10::Half>> ||\n    "
+            )
             if k == UfuncKey.CUDAFunctorOnSelf:
                 complex_half_cond = ""
             is_simple_str = f"""template <int cc_major, int /*cc_minor*/>

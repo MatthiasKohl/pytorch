@@ -31,7 +31,7 @@ struct LogicalOrFunctor {
   // only non-simple are: complex<double>, complex<float> with binary functor,
   // and double with binary functor.
   template <int /*cc_major*/, int /*cc_minor*/, FunctorType functor_type>
-  static constexpr bool is_simple = 
+  static constexpr bool is_simple =
   !(std::is_same_v<scalar_t, c10::complex<double>> ||
     (std::is_same_v<scalar_t, c10::complex<float>> && functor_type == FunctorType::Binary) ||
     (std::is_same_v<scalar_t, double> && functor_type == FunctorType::Binary));

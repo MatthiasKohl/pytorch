@@ -62,7 +62,7 @@ struct get_is_simple<func_t, cc_major, cc_minor, std::void_t<
     > {
   static constexpr bool value = func_t::template is_simple<cc_major, cc_minor>;
 };
-  
+
 #ifdef USE_ROCM
 // Custom configuration for vectorized elementwise kernel
 // with template instantiation.
