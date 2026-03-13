@@ -243,13 +243,9 @@ struct TuningConstantsSelector {
     // the compiler will need to issue more and more instructions to comply with
     // register constraints. For non-simple lambdas, we thus limit unroll to 8.
     static constexpr int max_unroll = is_simple ? 32 : 8;
-    // TODO rubin with 96 bytes: (is_simple && !small_footprint ? 96 : 16)
-
     // note: in order to allow more flexibility for the compiler with register
     // constraints, we allow up to 2 unroll sequences per loaded set of registers.
     static constexpr int max_vectors_per_unroll = 2;
-    // TODO rubin with 96 bytes: (is_simple && !small_footprint ? 3 : 2)
-
     // for non-simple lambdas, we want to hide more latency even within a thread,
     // thus we split the load set into 2 instructions.
     static constexpr int max_bytes_per_load_inst =
@@ -309,7 +305,11 @@ struct KernelConfig {
   static constexpr int load_vec_size = std::min(
     ::cuda::ceil_div(tc::max_bytes_per_load_inst, max_arg_size), max_elems_per_load_inst);
   // final vec size must be the minimum of the above two
-  static constexpr int vec_size = std::min(load_vec_size, store_vec_size);
+  static constexpr int vec_size_uncapped = std::min(load_vec_size, store_vec_size);
+  // NVCC bug: vec_size > 4 causes numerical mismatches with 1-byte types
+  // (e.g. uint8, int8) on sm80 and sm90. Cap at 4 for safety.
+  static constexpr int vec_size = int{sizeof(result_type)} < 2
+      ? std::min(vec_size_uncapped, 4) : vec_size_uncapped;
   // get the loads/stores per unroll according to max_vectors_per_unroll and max total unroll
   static_assert(max_total_unroll % vec_size == 0,
     "max_total_unroll must be a multiple of vec_size");
@@ -409,17 +409,16 @@ __device__ __noinline__ void vectorized_elementwise_kernel_fallback(
   if (remaining <= 0) {
     return;
   }
+  constexpr int block_elems_unroll = elems_per_thread_unroll * num_threads;
   // note: block 0 handles at most vec_size - 1 elements, so as long as
-  // num_threads * elems_per_thread_unroll is >= vec_size - 1, we will have
-  // a single iteration of the unrolled fallback. Since elems_per_thread must
-  // be strictly greater than vec_size - 1, the static_assert checks whether
-  // the above is satisfied.
-  static_assert(num_threads * elems_per_thread_unroll >= elems_per_thread,
-    "num_threads * elems_per_thread_unroll must be >= elems_per_thread");
+  // block_elems_unroll >= vec_size - 1, we will have a single iteration of
+  // the unrolled fallback. Since elems_per_thread must be strictly greater than
+  // vec_size - 1, the static_assert checks whether the above is satisfied.
+  static_assert(block_elems_unroll >= elems_per_thread,
+    "block_elems_unroll must be >= elems_per_thread");
   // Block 1 handles at most elems_per_thread * num_threads - 1 elements,
   // so the number of iterations is
   // ceil_div(elems_per_thread * num_threads - 1, block_elems_unroll).
-  constexpr int block_elems_unroll = elems_per_thread_unroll * num_threads;
   int max_iters = blockIdx.x == 0 ? 1 : ::cuda::ceil_div(
     elems_per_thread * num_threads - 1, block_elems_unroll);
 
