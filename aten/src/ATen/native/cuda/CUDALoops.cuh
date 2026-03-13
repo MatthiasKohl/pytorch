@@ -223,7 +223,7 @@ struct TuningConstantsSelector {
     static constexpr int cc_minor = cc_minor_;
     static constexpr bool small_footprint = small_footprint_;
     static constexpr bool is_simple =
-        get_is_simple<func_t_, cc_major_, cc_minor_>::value;
+        get_is_simple<func_t, cc_major, cc_minor>::value;
     // note: for a simple vectorized kernel, there is no point in having more than
     // 128 threads per block: this will just cause less parallelism (bad at lower sizes),
     // and using less than 128 threads per block risks under-using warp schedulers
@@ -235,7 +235,7 @@ struct TuningConstantsSelector {
     // currently supported architectures, 16 bytes per thread is sufficient.
     // For small footprints, we always use 16 bytes per thread.
     static constexpr int bytes_per_thread = (
-      ((cc_major == 8 && cc_minor == 0 && is_simple) || 
+      ((cc_major == 8 && cc_minor == 0 && is_simple) ||
       cc_major == 9 || cc_major == 10) &&
       !small_footprint) ? 32 : 16;
     // note: the max unroll plays an important role for lambdas with many instructions:
@@ -297,7 +297,7 @@ struct KernelConfig {
   static constexpr int elems_per_thread = tc::bytes_per_thread / max_arg_size;
   // now we know the total elems per block
   static constexpr int block_elems = elems_per_thread * tc::threads_per_block;
-  
+
   // maximum number of elements that can fit in one IO instruction
   static constexpr int max_elems_per_load_inst = max_io_size / max_arg_size;
   static constexpr int max_elems_per_store_inst = max_io_size / int{sizeof(result_type)};
@@ -324,7 +324,7 @@ struct KernelConfig {
 
   // in case we are simply unrolling, we should just limit the
   // elements per thread (and block) to max_unroll_fallback
-  // note: the unrolled path typically reuqires significantly more registers
+  // note: the unrolled path typically requires significantly more registers
   // for bounds-checking and branching (required at least for every load/store),
   // so limit unroll more than for the vectorized path.
   static constexpr int elems_per_thread_unroll = std::min(elems_per_thread, tc::max_unroll_fallback);
