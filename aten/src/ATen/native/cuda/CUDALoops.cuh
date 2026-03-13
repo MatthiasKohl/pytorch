@@ -363,10 +363,9 @@ struct KernelConfig {
     // vec_size-aligned boundary (at most vec_size - 1).
     int aligned_offset = (vec_size - r) % vec_size;
     int64_t tail = N - aligned_offset;
-    // round down to elems_per_unroll so the suffix is at most
-    // elems_per_unroll - 1 elements, which the fallback can handle.
+    // round down to block_elems so that every inner block is a full tile
     int aligned_size = tail > 0
-        ? static_cast<int>((tail / elems_per_unroll) * elems_per_unroll) : 0;
+        ? static_cast<int>((tail / block_elems) * block_elems) : 0;
     return {aligned_offset, aligned_size};
   }
 
@@ -397,63 +396,58 @@ template <int num_threads,
           int elems_per_thread,
           typename args_tuple,
           typename result_type,
-          bool add_unrolled_fallback,
           typename func_t,
           typename array_t>
 __device__ __noinline__ void vectorized_elementwise_kernel_fallback(
     int N, func_t f, array_t data, int aligned_offset, int aligned_size) {
+  int block1_start = aligned_offset + aligned_size;
+  // Block 0 processes [0, aligned_offset).
+  // Block 1 processes [aligned_offset+aligned_size, N).
+  int remaining = blockIdx.x == 0 ? aligned_offset : N - block1_start;
+
   // add an early exit: this avoids loading unnecessary code for common cases
-  if (aligned_offset == 0 && aligned_size == N) {
+  if (remaining <= 0) {
     return;
   }
+  // note: block 0 handles at most vec_size - 1 elements, so as long as
+  // num_threads * elems_per_thread_unroll is >= vec_size - 1, we will have
+  // a single iteration of the unrolled fallback. Since elems_per_thread must
+  // be strictly greater than vec_size - 1, the static_assert checks whether
+  // the above is satisfied.
+  static_assert(num_threads * elems_per_thread_unroll >= elems_per_thread,
+    "num_threads * elems_per_thread_unroll must be >= elems_per_thread");
+  // Block 1 handles at most elems_per_thread * num_threads - 1 elements,
+  // so the number of iterations is
+  // ceil_div(elems_per_thread * num_threads - 1, block_elems_unroll).
+  constexpr int block_elems_unroll = elems_per_thread_unroll * num_threads;
+  int max_iters = blockIdx.x == 0 ? 1 : ::cuda::ceil_div(
+    elems_per_thread * num_threads - 1, block_elems_unroll);
 
-  int remaining = 0;
-  bool zero_idx = true;
-
-  // in this case, we may have aligned_offset < 0 -> fully unrolled fallback
-  // or we have boundary blocks, in which case we need to handle the
-  // unaligned prefix/suffix with two sub-cases:
-  // First block (blockIdx.x==0) processes [0, aligned_offset).
-  // Last block processes [aligned_offset+aligned_size, N).
-  if (blockIdx.x == 0 && (!add_unrolled_fallback || aligned_offset >= 0)) {
-    remaining = aligned_offset;
-  } else if (!add_unrolled_fallback || aligned_offset >= 0) {
-    memory::policies::advance_data<result_type, args_tuple>(data, aligned_offset + aligned_size);
-    remaining = N - aligned_offset - aligned_size;
-  } else if (add_unrolled_fallback) {
-    constexpr int block_elems_unroll = elems_per_thread_unroll * num_threads;
-    remaining = N - block_elems_unroll * static_cast<int>(blockIdx.x);
-    zero_idx = false;
+  if (blockIdx.x == 1) {
+    memory::policies::advance_data<result_type, args_tuple>(data, block1_start);
   }
 
   auto input_calc = TrivialOffsetCalculator<std::tuple_size_v<args_tuple>>();
   auto output_calc = TrivialOffsetCalculator<1>();
-  
-  // note: we are always using elems_per_thread_unroll here for the policy.
-  // in the case where aligned_offset >= 0, we may technically have
-  // a different number of elements per thread, but the only place where
-  // this really matters is for the offset calculation (based on number
-  // of block elements). However, in the case where aligned_offset >= 0,
-  // the index for offset calculation is always 0, and we can only have
-  // up to elems_per_thread elements calculated by these blocks.
-  // the below static assert also ensure that the block size is always
-  // large enough to cover this case.
-  static_assert(
-    elems_per_thread_unroll * num_threads >= elems_per_thread,
-    "block size is not large enough to cover the case where aligned_offset >= 0");
-  auto policy = memory::policies::unroll_base<
-    num_threads,
-    array_t,
-    decltype(input_calc),
-    decltype(output_calc),
-    memory::LoadWithoutCast,
-    memory::StoreWithoutCast,
-    elems_per_thread_unroll,
-    /*num_outputs*/1,
-    /*check_compute_bounds*/false>(
-      data, remaining, input_calc, output_calc,
-      memory::LoadWithoutCast(), memory::StoreWithoutCast());
-  elementwise_kernel_helper(f, policy, zero_idx);
+
+  #pragma unroll 1
+  for (int iter = 0; iter < max_iters; ++iter) {
+    auto policy = memory::policies::unroll_base<
+      num_threads,
+      array_t,
+      decltype(input_calc),
+      decltype(output_calc),
+      memory::LoadWithoutCast,
+      memory::StoreWithoutCast,
+      elems_per_thread_unroll,
+      /*num_outputs*/1,
+      /*check_compute_bounds*/false>(
+        data, remaining, input_calc, output_calc,
+        memory::LoadWithoutCast(), memory::StoreWithoutCast());
+    elementwise_kernel_helper(f, policy, /*zero_idx*/true);
+    memory::policies::advance_data<result_type, args_tuple>(data, block_elems_unroll);
+    remaining -= block_elems_unroll;
+  }
 }
 
 // note: we explicitly put all relevant parameters as template parameters
@@ -477,14 +471,6 @@ __global__ void vectorized_elementwise_kernel(int N, func_t f, array_t data, int
   using result_type = typename traits::result_type;
   constexpr int block_elems = elems_per_thread * num_threads;
 
-  // note: it is possible to just add a fallback to the vectorized kernel
-  // s.t. all blocks handle cases where no vectorization is possible.
-  // In this case, we should avoid instantiating the unrolled kernel at all,
-  // and thus use this kernel even for dynamic casting cases.
-  // For now, we keep the unrolled kernel, but leave the option here
-  // to quickly switch to the fallback path.
-  constexpr bool add_unrolled_fallback = false;
-
   if constexpr (small_footprint) {
     // for small footprints, we assume that both input/output base pointers
     // and sizes are aligned to the vector size. Thus, there is no fallback.
@@ -501,14 +487,12 @@ __global__ void vectorized_elementwise_kernel(int N, func_t f, array_t data, int
         array_t>(data, remaining);
     streaming_elementwise_kernel_helper<num_unrolls>(f, policy);
   } else {
-    // for larger footprints (or unaligned inputs/outputs), we have a fallback
-    // path s.t. the first block handles only elements up to the first aligned
-    // pointer and the last block handles only elements after the last aligned
-    // pointer.
-    bool is_inner_block = blockIdx.x > 0 && blockIdx.x < gridDim.x - 1;
-    if (is_inner_block && (!add_unrolled_fallback || aligned_offset >= 0)) {
+    // Blocks 0 and 1 are fallback blocks handling the unaligned
+    // prefix and suffix respectively. Blocks >= 2 are inner blocks
+    // that process full vectorized block tiles.
+    if (blockIdx.x >= 2) {
       memory::policies::advance_data<result_type, args_tuple>(data,
-          aligned_offset + static_cast<int>(blockIdx.x - 1) * block_elems);
+          aligned_offset + static_cast<int>(blockIdx.x - 2) * block_elems);
       int remaining = -1;  // inner blocks must be full tiles
       auto policy = memory::policies::streaming_vectorized<
           /*has_remaining*/false,
@@ -525,8 +509,7 @@ __global__ void vectorized_elementwise_kernel(int N, func_t f, array_t data, int
           elems_per_thread_unroll,
           elems_per_thread,
           args_tuple,
-          result_type,
-          add_unrolled_fallback>(N, f, data, aligned_offset, aligned_size);
+          result_type>(N, f, data, aligned_offset, aligned_size);
     }
   }
 }
@@ -728,7 +711,7 @@ static inline void launch_vectorized_kernel(
     TORCH_INTERNAL_ASSERT(aligned_offset >= 0);
     TORCH_INTERNAL_ASSERT(aligned_offset < config_default::vec_size);
     TORCH_INTERNAL_ASSERT(aligned_size >= 0 && aligned_size <= N);
-    TORCH_INTERNAL_ASSERT(N - aligned_offset - aligned_size < config_default::elems_per_unroll);
+    TORCH_INTERNAL_ASSERT(N - aligned_offset - aligned_size < config_default::block_elems);
     auto lc = config_default::launch_config(N, aligned_size);
     auto& kernel = vectorized_elementwise_kernel<
       tc_default::threads_per_block,
