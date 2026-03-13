@@ -148,7 +148,7 @@ def evaluate_platform_supports_workqueue_config():
     driver_version = torch.utils.collect_env.get_nvidia_driver_version(torch.utils.collect_env.run)
     if driver_version is None:
         return False
-    return int(driver_version.split('.')[0]) >= 575
+    return int(driver_version.split('.')[0]) >= 590
 
 PLATFORM_SUPPORTS_WORKQUEUE_CONFIG: bool = LazyVal(lambda: evaluate_platform_supports_workqueue_config())
 
