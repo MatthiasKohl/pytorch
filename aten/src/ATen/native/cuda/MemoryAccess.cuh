@@ -284,32 +284,36 @@ struct unroll_base {
   template<typename args_t>
   __device__ inline void load(args_t *args, int idx) {
     constexpr int arity = std::tuple_size_v<args_t>;
-    int base_idx = threadIdx.x + block_work_size * idx;
+    int thread_idx = threadIdx.x;
+    int base_idx = thread_idx + block_work_size * idx;
 
     #pragma unroll
     for (int i = 0; i < elems_per_thread; i++) {
       int linear_idx = base_idx + i * num_threads;
       auto offset = input_offset_calculator.get(linear_idx);
-      if (linear_idx < remaining) {
+      if (thread_idx < remaining) {
         detail::static_unroll<detail::unroll_load_helper, arity>::with_args(
             *this, args, offset, loader, i, num_outputs);
       } else {
         detail::static_unroll<detail::reset_helper, arity>::with_args(args, i);
       }
+      thread_idx += num_threads;
     }
   }
 
   template<typename scalar_t>
   __device__ inline void store(scalar_t *from, int idx) {
-    int base_idx = threadIdx.x + block_work_size * idx;
+    int thread_idx = threadIdx.x;
+    int base_idx = thread_idx + block_work_size * idx;
 
     #pragma unroll
     for (int i = 0; i < elems_per_thread; i++) {
       int linear_idx = base_idx + i * num_threads;
       int offset = output_offset_calculator.get(linear_idx)[0];
-      if (linear_idx < remaining) {
+      if (thread_idx < remaining) {
         storer.store(from[i], data[0], offset);
       }
+      thread_idx += num_threads;
     }
   }
 };
