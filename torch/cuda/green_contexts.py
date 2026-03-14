@@ -89,6 +89,6 @@ class GreenContext(_GreenContext):
         """
         return super().pop_context()  # type: ignore[misc]
 
-    def Stream(self) -> torch.cuda.Stream:
+    def Stream(self) -> "torch.cuda.Stream":
         r"""Return the CUDA Stream used by the green context."""
         return super().Stream()
