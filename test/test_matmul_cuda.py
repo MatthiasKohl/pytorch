@@ -1092,6 +1092,10 @@ class TestMatmulCuda(InductorTestCase):
                     # note we need to record timing events to ensure that the
                     # workqueue is actually used
                     wq_events[i * 2].record(s)
+                    # 100M cycles is enough on all currently supported GPUs
+                    # to ensure that the test runs significantly longer than
+                    # host overhead to 1) activate the different streams,
+                    # 2) record timing events, and 3) synchronize with the GPU.
                     torch.cuda._sleep(100_000_000)
                     wq_events[i * 2 + 1].record(s)
             torch.cuda.synchronize()
