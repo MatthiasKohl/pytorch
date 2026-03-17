@@ -1075,28 +1075,33 @@ class TestMatmulCuda(InductorTestCase):
     @unittest.skipIf(not PLATFORM_SUPPORTS_WORKQUEUE_CONFIG, "Workqueue config is not supported")
     @serialTest()
     def test_greencontext_workqueue_concurrency_limit(self):
+        # Note: this test simply tests green context workqueue concurrency limiting,
+        # It doesn't test matmuls specifically, but is kept here along with other
+        # green context functional tests.
+        n_streams = 4
         GreenContext = torch.cuda.green_contexts.GreenContext
         max_wq = GreenContext.max_workqueue_concurrency(device_id=0)
-        if max_wq <= 1:
-            self.skipTest(f"Device has {max_wq} workqueue(s), need >1 to test concurrency limiting")
+        if max_wq < n_streams:
+            self.skipTest(f"Device has {max_wq} workqueue(s), need >{n_streams} to test concurrency limiting")
 
-        n_streams = 8
-        inputs = [torch.randn(256, 256, device='cuda', dtype=torch.bfloat16) for _ in range(n_streams)]
+        wq_events = [torch.cuda.Event(enable_timing=True) for _ in range(n_streams * 2)]
 
-        def run_multi_stream_matmuls(streams):
-            results = [None] * n_streams
+        def run_multi_stream_sleep(streams):
             for i, s in enumerate(streams):
                 with torch.cuda.stream(s):
-                    results[i] = torch.matmul(inputs[i], inputs[i])
+                    # note we need to record timing events to ensure that the
+                    # workqueue is actually used
+                    wq_events[i * 2].record(s)
+                    torch.cuda._sleep(100_000_000)
+                    wq_events[i * 2 + 1].record(s)
             torch.cuda.synchronize()
-            return results
 
-        # Baseline: 8 streams from default context, full workqueue concurrency
+        # Baseline: n_streams streams from default context, full workqueue concurrency
         baseline_streams = [torch.cuda.Stream() for _ in range(n_streams)]
-        run_multi_stream_matmuls(baseline_streams)  # warmup
-        torch.cuda.synchronize()
+        # note: torch.cuda.synchronize() will wait for all kernels on all streams
+        # so we can safely use CPU based timing here.
         t0 = time.perf_counter()
-        baseline_results = run_multi_stream_matmuls(baseline_streams)
+        run_multi_stream_sleep(baseline_streams)
         t1 = time.perf_counter()
         baseline_time = t1 - t0
 
@@ -1108,16 +1113,12 @@ class TestMatmulCuda(InductorTestCase):
         )
         ctx.set_context()
         green_streams = [ctx.Stream() for _ in range(n_streams)]
-        run_multi_stream_matmuls(green_streams)  # warmup
-        torch.cuda.synchronize()
         t2 = time.perf_counter()
-        limited_results = run_multi_stream_matmuls(green_streams)
+        run_multi_stream_sleep(green_streams)
         t3 = time.perf_counter()
         ctx.pop_context()
         limited_time = t3 - t2
 
-        for baseline_r, limited_r in zip(baseline_results, limited_results):
-            self.assertEqual(baseline_r, limited_r)
         self.assertGreater(limited_time, baseline_time)
 
 
