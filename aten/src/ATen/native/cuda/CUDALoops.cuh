@@ -40,7 +40,9 @@
 #include <c10/macros/Macros.h>
 #include <c10/util/TypeCast.h>
 
+#ifndef USE_ROCM
 #include <cuda/cmath>
+#endif
 
 #ifdef __NVCC__
 #define ASSERT_HOST_DEVICE_LAMBDA(type)                       \
