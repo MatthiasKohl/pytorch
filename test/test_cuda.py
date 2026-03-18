@@ -8582,7 +8582,9 @@ class TestFXMemoryProfiler(TestCase):
                 self.assertIn("e = self.relu(d)", frame["fx_original_trace"])
 
 
-@unittest.skipIf(not PLATFORM_SUPPORTS_GREEN_CONTEXT, "Green contexts are not supported")
+@unittest.skipIf(
+    not PLATFORM_SUPPORTS_GREEN_CONTEXT, "Green contexts are not supported"
+)
 class TestCudaGreenContexts(TestCase):
     def setUp(self):
         super().setUp()
@@ -8593,7 +8595,7 @@ class TestCudaGreenContexts(TestCase):
     @serialTest()
     def test_greencontext_carveout(self):
         # By default, everything is performed on the current device
-        a = torch.randn(4096, 4096, device='cuda', dtype=torch.bfloat16)
+        a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
         ctx = torch.cuda.green_contexts.GreenContext.create(num_sms=1)
         ctx.set_context()
         torch.matmul(a, a)
@@ -8615,7 +8617,7 @@ class TestCudaGreenContexts(TestCase):
     @serialTest()
     def test_greencontext_stream_carveout(self):
         # By default, everything is performed on the current device
-        a = torch.randn(4096, 4096, device='cuda', dtype=torch.bfloat16)
+        a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
         ctx = torch.cuda.green_contexts.GreenContext.create(num_sms=1)
         ctx_stream = ctx.Stream()
         with torch.cuda.stream(ctx_stream):
@@ -8637,7 +8639,7 @@ class TestCudaGreenContexts(TestCase):
     @serialTest()
     def test_greencontext_graphs(self):
         # By default, everything is performed on the current device
-        a = torch.randn(4096, 4096, device='cuda', dtype=torch.bfloat16)
+        a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
         ctx = torch.cuda.green_contexts.GreenContext.create(num_sms=1)
         ctx.set_context()
         partial_res = torch.matmul(a, a)
@@ -8656,7 +8658,9 @@ class TestCudaGreenContexts(TestCase):
         g.replay()
         self.assertEqual(partial_res, full_res)
 
-    @unittest.skipIf(not PLATFORM_SUPPORTS_WORKQUEUE_CONFIG, "Workqueue config is not supported")
+    @unittest.skipIf(
+        not PLATFORM_SUPPORTS_WORKQUEUE_CONFIG, "Workqueue config is not supported"
+    )
     @serialTest()
     def test_greencontext_workqueue_concurrency_limit(self):
         # By default, everything is performed on the current device
@@ -8664,7 +8668,9 @@ class TestCudaGreenContexts(TestCase):
         GreenContext = torch.cuda.green_contexts.GreenContext
         max_wq = GreenContext.max_workqueue_concurrency()
         if max_wq < n_streams:
-            self.skipTest(f"Device has {max_wq} workqueue(s), need >{n_streams} to test concurrency limiting")
+            self.skipTest(
+                f"Device has {max_wq} workqueue(s), need >{n_streams} to test concurrency limiting"
+            )
 
         wq_events = [torch.cuda.Event(enable_timing=True) for _ in range(n_streams * 2)]
 
