@@ -87,6 +87,8 @@ GreenContext::GreenContext(
   // --- Workqueue config resource ---
   if (workqueue_scope.has_value()) {
 #if HAS_CUDA_WORKQUEUE_SUPPORT()
+    TORCH_CHECK(
+        driver_version >= 13010, "cuda driver too old to use workqueue configuration!");
     CUdevResource wq_resource{};
     C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuDeviceGetDevResource_(
         device, &wq_resource, CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG));
@@ -146,6 +148,10 @@ std::unique_ptr<GreenContext> GreenContext::create(
 uint32_t GreenContext::max_workqueue_concurrency(
     std::optional<uint32_t> device_id) {
 #if HAS_CUDA_WORKQUEUE_SUPPORT()
+  int driver_version;
+  C10_CUDA_CHECK(cudaDriverGetVersion(&driver_version));
+  TORCH_CHECK(
+      driver_version >= 13010, "cuda driver too old to use workqueue configuration!");
   if (!device_id.has_value()) {
     device_id = at::cuda::current_device();
   }
