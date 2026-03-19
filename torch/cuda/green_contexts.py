@@ -1,4 +1,3 @@
-from typing import Optional
 
 import torch
 
@@ -27,10 +26,10 @@ class GreenContext(_GreenContext):
     @staticmethod
     def create(
         *,
-        num_sms: Optional[int] = None,
-        workqueue_scope: Optional[str] = None,
-        workqueue_concurrency_limit: Optional[int] = None,
-        device_id: Optional[int] = None,
+        num_sms: int | None = None,
+        workqueue_scope: str | None = None,
+        workqueue_concurrency_limit: int | None = None,
+        device_id: int | None = None,
     ) -> _GreenContext:
         r"""Create a CUDA green context.
 
@@ -62,7 +61,7 @@ class GreenContext(_GreenContext):
         )
 
     @staticmethod
-    def max_workqueue_concurrency(device_id: Optional[int] = None) -> int:
+    def max_workqueue_concurrency(device_id: int | None = None) -> int:
         r"""Return the maximum workqueue concurrency limit for the device.
 
         This queries the device for the default number of concurrent
