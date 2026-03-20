@@ -8579,7 +8579,7 @@ class TestCudaGreenContexts(TestCase):
         s = torch.cuda.Stream()
         with torch.cuda.stream(s):
             start_stream = torch.cuda.current_stream()
-            ctx = torch.cuda.green_contexts.GreenContext.create(n_sms=1)
+            ctx = torch.cuda.green_contexts.GreenContext.create(num_sms=1)
             ctx.set_context()
             context_stream = torch.cuda.current_stream()
             ctx.pop_context()
