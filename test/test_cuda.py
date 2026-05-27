@@ -10226,7 +10226,7 @@ class TestCudaGreenContexts(TestCase):
         s = torch.cuda.Stream()
         with torch.cuda.stream(s):
             start_stream = torch.cuda.current_stream()
-            ctx = torch.cuda.green_contexts.GreenContext.create(num_sms=1)
+            ctx = torch.cuda.green_contexts.GreenContext(num_sms=1)
             ctx.set_context()
             context_stream = torch.cuda.current_stream()
             ctx.pop_context()
@@ -10238,7 +10238,7 @@ class TestCudaGreenContexts(TestCase):
     def test_greencontext_carveout(self):
         # By default, everything is performed on the current device
         a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
-        ctx = torch.cuda.green_contexts.GreenContext.create(num_sms=1)
+        ctx = torch.cuda.green_contexts.GreenContext(num_sms=1)
         ctx.set_context()
         torch.matmul(a, a)
         torch.cuda.synchronize()
@@ -10263,7 +10263,7 @@ class TestCudaGreenContexts(TestCase):
     def test_greencontext_stream_carveout(self):
         # By default, everything is performed on the current device
         a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
-        ctx = torch.cuda.green_contexts.GreenContext.create(num_sms=1)
+        ctx = torch.cuda.green_contexts.GreenContext(num_sms=1)
         ctx_stream = ctx.Stream()
         with torch.cuda.stream(ctx_stream):
             torch.matmul(a, a)
@@ -10285,7 +10285,7 @@ class TestCudaGreenContexts(TestCase):
     def test_greencontext_graphs(self):
         # By default, everything is performed on the current device
         a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
-        ctx = torch.cuda.green_contexts.GreenContext.create(num_sms=1)
+        ctx = torch.cuda.green_contexts.GreenContext(num_sms=1)
         ctx.set_context()
         partial_res = torch.matmul(a, a)
         ctx.pop_context()
@@ -10347,7 +10347,7 @@ class TestCudaGreenContexts(TestCase):
         baseline_time = t1 - t0
 
         # Green context with workqueue concurrency limited to 1
-        ctx = GreenContext.create(
+        ctx = GreenContext(
             workqueue_scope="balanced",
             workqueue_concurrency_limit=1,
         )
