@@ -194,7 +194,7 @@ def _check_allocator_settings_on_tear_down(test_case):
     # expandable_segments knob mismatched against the suite's env-derived
     # baseline. This should be called in the class's `tearDown` method.
     md = torch.cuda.memory._snapshot()["allocator_settings"]
-    self.assertEqual(md["expandable_segments"], EXPANDABLE_SEGMENTS)
+    test_case.assertEqual(md["expandable_segments"], EXPANDABLE_SEGMENTS)
 
 
 @unittest.skipIf(not TEST_CUDA, "CUDA not available, skipping tests")
