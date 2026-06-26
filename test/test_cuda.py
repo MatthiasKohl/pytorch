@@ -10363,6 +10363,25 @@ class TestCudaGreenContexts(TestCase):
             self.assertEqual(start_stream.cuda_stream, end_stream.cuda_stream)
             self.assertNotEqual(start_stream.cuda_stream, context_stream.cuda_stream)
 
+    def test_greencontext_default_stream_restores_stream(self):
+        # need to start on a side stream as we are comparing pointers and want to avoid
+        # two NULL streams...
+        s = torch.cuda.Stream()
+        with torch.cuda.stream(s):
+            start_stream = torch.cuda.current_stream()
+            ctx = torch.cuda.green_contexts.GreenContext(num_sms=1)
+            stream_context = ctx.default_stream()
+            with stream_context as context_value:
+                self.assertIsNone(context_value)
+                context_stream = torch.cuda.current_stream()
+            end_stream = torch.cuda.current_stream()
+            self.assertIsInstance(stream_context, torch.cuda.StreamContext)
+            self.assertEqual(
+                stream_context.stream.cuda_stream, context_stream.cuda_stream
+            )
+            self.assertEqual(start_stream.cuda_stream, end_stream.cuda_stream)
+            self.assertNotEqual(start_stream.cuda_stream, context_stream.cuda_stream)
+
     @serialTest()
     def test_greencontext_carveout(self):
         # By default, everything is performed on the current device

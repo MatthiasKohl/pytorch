@@ -109,6 +109,7 @@ class GreenContext:
         self._device_id = None
         self._green_ctx = None
         self._context = None
+        self._default_stream = None
         _ensure_supported()
 
         scope_value = _parse_workqueue_scope(workqueue_scope)
@@ -193,12 +194,19 @@ class GreenContext:
             context = _check_cuda_bindings(_drv.cuCtxFromGreenCtx(green_ctx))
             if int(context) == 0:
                 raise RuntimeError("Green ctx conversion to regular ctx failed!")
+            default_stream = _check_cuda_bindings(
+                _drv.cuGreenCtxStreamCreate(  # pyrefly: ignore [missing-attribute]
+                    green_ctx,
+                    _drv.CUstream_flags.CU_STREAM_NON_BLOCKING,  # pyrefly: ignore [missing-attribute]
+                    0,
+                )
+            )
         except Exception:
             # pyrefly: ignore [missing-attribute]
             _check_cuda_bindings(_drv.cuGreenCtxDestroy(green_ctx))
             raise
 
-        self._init_from_cuda_objects(device_id, green_ctx, context)
+        self._init_from_cuda_objects(device_id, green_ctx, context, default_stream)
 
     def __del__(self) -> None:
         green_ctx = getattr(self, "_green_ctx", None)
@@ -217,6 +225,16 @@ class GreenContext:
                     f"Error while destroying green context stream at idx {idx} "
                     f"for green context {green_ctx}: {e}"
                 )
+        if self._default_stream is not None:
+            try:
+                # pyrefly: ignore [missing-attribute]
+                _check_cuda_bindings(_drv.cuStreamDestroy(self._default_stream))
+            except RuntimeError as e:
+                warnings.warn(
+                    f"Error while destroying green context default stream "
+                    f"for green context {green_ctx}: {e}"
+                )
+            self._default_stream = None
         self._green_ctx = None
         try:
             # pyrefly: ignore [missing-attribute]
@@ -224,10 +242,13 @@ class GreenContext:
         except RuntimeError as e:
             warnings.warn(f"Error while destroying green context {green_ctx}: {e}")
 
-    def _init_from_cuda_objects(self, device_id: int, green_ctx, context) -> None:
+    def _init_from_cuda_objects(
+        self, device_id: int, green_ctx, context, default_stream
+    ) -> None:
         self._device_id = device_id
         self._green_ctx = green_ctx
         self._context = context
+        self._default_stream = default_stream
         self._parent_stream: torch.cuda.Stream | None = None
         self._green_ctx_streams: list[Any | None] = [
             None
@@ -281,11 +302,24 @@ class GreenContext:
         return wq_resource.wqConfig.wqConcurrencyLimit
 
     def _ensure_alive(self) -> None:
-        if self._green_ctx is None or self._context is None:
+        if (
+            self._green_ctx is None
+            or self._context is None
+            or self._default_stream is None
+        ):
             raise RuntimeError("GreenContext has been destroyed")
 
     def set_context(self) -> None:
-        r"""Make the green context the current context."""
+        r"""Make the green context the current context.
+
+        This explicitly pushes the CUDA context associated with the green
+        context onto the current thread's context stack, and synchronizes
+        the green context's default stream with the current stream through
+        events. Note: this method of activating the green context is only
+        useful for operations not using a stream, and can add CPU-side latency.
+        For most use cases, prefer ``default_stream`` to activate the resources
+        associated with this green context.
+        """
         self._ensure_alive()
         if self._parent_stream is not None:
             raise RuntimeError("set_context called twice before pop_context")
@@ -311,6 +345,10 @@ class GreenContext:
     def pop_context(self) -> None:
         r"""Assuming the green context is the current context, pop it from the
         context stack and restore the previous context.
+
+        This pairs with ``set_context`` for explicit context-stack management.
+        For most uses, prefer ``default_stream`` instead, see ``set_context``
+        for the reasoning behind this.
         """
         try:
             self._ensure_alive()
@@ -350,3 +388,24 @@ class GreenContext:
         self._curr_stream_idx = curr_idx
         # pyrefly: ignore [bad-argument-type]
         return torch.cuda.ExternalStream(int(green_ctx_stream), self._device_id)
+
+    def get_default_stream(self) -> torch.cuda.Stream:
+        r"""Return the default stream associated with this green context"""
+        self._ensure_alive()
+        # pyrefly: ignore [bad-argument-type]
+        return torch.cuda.ExternalStream(int(self._default_stream), self._device_id)
+
+    def default_stream(self) -> torch.cuda.StreamContext:
+        r"""Return a context manager for this green context's default stream.
+
+        Entering the context simply activates the default stream associated
+        with this green context, like ``torch.cuda.stream`` is used with a
+        custom stream returned by ``Stream``.
+        Note: any CUDA operation using a stream will ensure the green context
+        resources are used, so activating the green context's default stream
+        activates the green context resources for almost all CUDA operations.
+
+        Note: to ensure synchronization with other streams, custom events
+        must be used, just like with ``torch.cuda.stream``.
+        """
+        return torch.cuda.StreamContext(self.get_default_stream())
