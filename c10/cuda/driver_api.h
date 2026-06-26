@@ -86,7 +86,25 @@
   _(cuStreamWriteValue32, 12000)                   \
   _(cuGetErrorString, 12000)
 
-#if defined(CUDA_VERSION) && (CUDA_VERSION >= 12080)
+#if defined(CUDA_VERSION) && (CUDA_VERSION >= 13010)
+#define C10_LIBCUDA_DRIVER_API_OPTIONAL(_) \
+  _(cuCtxFromGreenCtx, 12080)              \
+  _(cuCtxGetCurrent, 12080)                \
+  _(cuCtxPopCurrent, 12080)                \
+  _(cuCtxPushCurrent, 12080)               \
+  _(cuCtxSetCurrent, 12080)                \
+  _(cuGreenCtxCreate, 12080)               \
+  _(cuGreenCtxDestroy, 12080)              \
+  _(cuGreenCtxStreamCreate, 12080)         \
+  _(cuDevSmResourceSplitByCount, 12080)    \
+  _(cuDeviceGetDevResource, 12080)         \
+  _(cuDevResourceGenerateDesc, 12080)      \
+  _(cuStreamGetDevResource, 13010)         \
+  _(cuMulticastAddDevice, 12030)           \
+  _(cuMulticastBindMem, 12030)             \
+  _(cuMulticastCreate, 12030)              \
+  _(cuMulticastUnbind, 12030)
+#elif defined(CUDA_VERSION) && (CUDA_VERSION >= 12080)
 #define C10_LIBCUDA_DRIVER_API_OPTIONAL(_) \
   _(cuCtxFromGreenCtx, 12080)              \
   _(cuCtxGetCurrent, 12080)                \

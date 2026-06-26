@@ -133,6 +133,7 @@ void run_cudnn_SDP_bprop_nestedtensor(
 #include <ATen/cudnn/Descriptors.h>
 #include <ATen/cudnn/Types.h>
 #include <ATen/cudnn/Utils.h>
+#include <ATen/native/cudnn/ConvShared.h>
 #include <ATen/native/cudnn/MHA.h>
 #include <ATen/native/transformers/sdp_utils.h>
 
@@ -226,6 +227,8 @@ struct MHAParams {
   // as signaling no-bias
   bool has_attn_bias;
   bool use_ragged;
+  uint32_t sm_count;
+  uint32_t sm_coscheduled_alignment;
 };
 
 void setMHAParams(
@@ -260,6 +263,10 @@ void setMHAParams(
   params.is_causal = is_causal;
   params.return_softmaxstats = return_softmaxstats;
   params.has_attn_bias = attn_bias.has_value();
+  auto stream_resource = getCuDNNStreamResource(params.device_id);
+  params.sm_count = stream_resource.sm_count;
+  params.sm_coscheduled_alignment =
+      stream_resource.sm_coscheduled_alignment;
   // Expect 4D dense tensor, 3D nested case (THD)
   TORCH_INTERNAL_ASSERT(
       q.sizes().size() == (uint8_t)(MAX_MHA_DIM - (uint8_t)is_nested),
@@ -350,8 +357,14 @@ struct MHACacheKeyWrapper : ParamsWrapper<MHAParams> {
 struct MHAGraphCache {
   using KeyType = MHACacheKeyWrapper;
   using ValueType = std::unique_ptr<fe::graph::Graph>;
+  struct CacheEntry {
+    explicit CacheEntry(const KeyType& key) : key(key), graph(nullptr) {}
+
+    KeyType key;
+    ValueType graph;
+  };
   using MapType =
-      std::unordered_map<KeyType, ValueType, ParamsWrapperHash<KeyType>>;
+      std::unordered_map<KeyType, CacheEntry, ParamsWrapperHash<KeyType>>;
   using iterator = typename MapType::iterator;
   using const_iterator = typename MapType::const_iterator;
 
@@ -363,6 +376,36 @@ struct MHAGraphCache {
   // pointer to the Execution Plan if we know it will not be invalidated by
   // another thread
   iterator find(const KeyType& key) {
+    record_lookup();
+    auto it = find_compatible(key);
+    if (it != engine_cache.end()) {
+      hits++;
+    }
+    return it;
+  }
+
+  std::pair<iterator, bool> get_or_create(const KeyType& key) {
+    record_lookup();
+    KeyType normalized_key = cudnn_cache_key_without_alignment(key);
+    auto it = engine_cache.find(normalized_key);
+    if (it == engine_cache.end()) {
+      return engine_cache.try_emplace(normalized_key, key);
+    }
+    if (cudnn_cache_key_resource_compatible(it->second.key, key)) {
+      hits++;
+      return {it, false};
+    }
+    it->second.key = key;
+    it->second.graph.reset();
+    return {it, true};
+  }
+
+  const_iterator end() const {
+    return engine_cache.end();
+  }
+
+ private:
+  void record_lookup() {
     static bool flag =
         c10::utils::check_env("TORCH_CUDNN_SDPA_CACHE_DEBUG") == true;
     if (flag && count) {
@@ -374,20 +417,17 @@ struct MHAGraphCache {
           "%");
     }
     count++;
-    auto it = engine_cache.find(key);
-    if (it != engine_cache.end()) {
-      hits++;
+  }
+
+  iterator find_compatible(const KeyType& key) {
+    auto it = engine_cache.find(cudnn_cache_key_without_alignment(key));
+    if (it == engine_cache.end()) {
+      return it;
+    }
+    if (!cudnn_cache_key_resource_compatible(it->second.key, key)) {
+      return engine_cache.end();
     }
     return it;
-  }
-
-  const_iterator end() const {
-    return engine_cache.end();
-  }
-
-  template <typename... Args>
-  std::pair<iterator, bool> try_emplace(const KeyType& key, Args&&... args) {
-    return engine_cache.try_emplace(key, std::forward<Args>(args)...);
   }
 };
 
@@ -1439,9 +1479,9 @@ void run_cudnn_SDP_fprop(
       is_causal,
       return_softmaxstats,
       false);
-  auto [cache_it, not_found] = getMHAGraphCache_().try_emplace(key, nullptr);
+  auto [cache_it, not_found] = getMHAGraphCache_().get_or_create(key);
   if (not_found) {
-    cache_it->second = build_graph(
+    cache_it->second.graph = build_graph(
         b,
         h,
         s_q,
@@ -1462,7 +1502,7 @@ void run_cudnn_SDP_fprop(
         _dropoutoffset,
         handle);
   }
-  const fe::graph::Graph& mha_graph = *cache_it->second;
+  const fe::graph::Graph& mha_graph = *cache_it->second.graph;
   std::unordered_map<int64_t, void*> variant_pack = {
       {Q, q.mutable_data_ptr()},
       {K, k.mutable_data_ptr()},
@@ -1560,10 +1600,9 @@ void run_cudnn_SDP_fprop_nestedtensor(
       true);
 
   MHAGraphCache& cache = getMHAGraphCache_();
-  auto cache_it = cache.find(key);
-  std::unique_ptr<fe::graph::Graph> mha_graph_storage;
-  if (cache_it == cache.end()) {
-    mha_graph_storage = build_graph_nestedtensor(
+  auto [cache_it, not_found] = cache.get_or_create(key);
+  if (not_found) {
+    cache_it->second.graph = build_graph_nestedtensor(
         b,
         h_q,
         h_k,
@@ -1588,8 +1627,7 @@ void run_cudnn_SDP_fprop_nestedtensor(
         dropoutoffset,
         handle);
   }
-  const fe::graph::Graph& mha_graph =
-      mha_graph_storage ? *mha_graph_storage : *cache_it->second;
+  const fe::graph::Graph& mha_graph = *cache_it->second.graph;
 
   auto seqlen_q = at::diff(cum_seqlen_q, 1, 0);
   auto seqlen_kv = at::diff(cum_seqlen_kv, 1, 0);
@@ -1723,9 +1761,9 @@ void run_cudnn_SDP_bprop(
       true,
       false);
   auto [cache_it, not_found] =
-      getMHAGraphBackwardCache_().try_emplace(key, nullptr);
+      getMHAGraphBackwardCache_().get_or_create(key);
   if (not_found) {
-    cache_it->second = build_graph_backward(
+    cache_it->second.graph = build_graph_backward(
         b,
         h,
         s_q,
@@ -1749,7 +1787,7 @@ void run_cudnn_SDP_bprop(
         _dropoutoffset,
         handle);
   }
-  const fe::graph::Graph& mha_graph = *cache_it->second;
+  const fe::graph::Graph& mha_graph = *cache_it->second.graph;
 
   std::unordered_map<int64_t, void*> variant_pack = {
       // inputs
@@ -1872,11 +1910,10 @@ void run_cudnn_SDP_bprop_nestedtensor(
       true,
       true);
 
-  MHAGraphCache& cache = getMHAGraphCache_();
-  auto cache_it = cache.find(key);
-  std::unique_ptr<fe::graph::Graph> mha_graph_storage;
-  if (cache_it == cache.end()) {
-    mha_graph_storage = build_graph_backward_nestedtensor(
+  MHAGraphCache& cache = getMHAGraphBackwardCache_();
+  auto [cache_it, not_found] = cache.get_or_create(key);
+  if (not_found) {
+    cache_it->second.graph = build_graph_backward_nestedtensor(
         b,
         h_q,
         h_k,
@@ -1904,8 +1941,7 @@ void run_cudnn_SDP_bprop_nestedtensor(
         dropoutoffset,
         handle);
   }
-  const fe::graph::Graph& mha_graph =
-      mha_graph_storage ? *mha_graph_storage : *cache_it->second;
+  const fe::graph::Graph& mha_graph = *cache_it->second.graph;
   std::unordered_map<int64_t, void*> variant_pack = {
       // inputs
       {Q, q.mutable_data_ptr()},

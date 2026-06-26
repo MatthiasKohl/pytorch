@@ -1,13 +1,104 @@
 #pragma once
 #include <ATen/core/Tensor.h>
 
+#include <ATen/cuda/CUDAConfig.h>
 #include <ATen/cudnn/Descriptors.h>
 #include <ATen/cudnn/Types.h>
 #include <ATen/cudnn/cudnn-wrapper.h>
 #include <ATen/native/ConvUtils.h>
+#include <ATen/native/utils/ParamsHash.h>
+
+#include <cstdint>
 
 namespace at {
 namespace native {
+
+struct CuDNNStreamResource {
+  uint32_t sm_count = 0;
+  uint32_t sm_coscheduled_alignment = 0;
+};
+
+CuDNNStreamResource getCuDNNStreamResource(c10::DeviceIndex device_id);
+
+template <typename Key>
+decltype(auto) cudnn_cache_key_pod(Key& key) {
+  if constexpr (requires { key.pod; }) {
+    return (key.pod);
+  } else {
+    return (key);
+  }
+}
+
+template <typename Key>
+decltype(auto) cudnn_cache_key_pod(const Key& key) {
+  if constexpr (requires { key.pod; }) {
+    return (key.pod);
+  } else {
+    return (key);
+  }
+}
+
+template <typename Params>
+decltype(auto) cudnn_cache_key_resource_fields(Params& params) {
+  if constexpr (requires {
+                  params.params.sm_count;
+                  params.params.sm_coscheduled_alignment;
+                }) {
+    return (params.params);
+  } else {
+    return (params);
+  }
+}
+
+template <typename Params>
+decltype(auto) cudnn_cache_key_resource_fields(const Params& params) {
+  if constexpr (requires {
+                  params.params.sm_count;
+                  params.params.sm_coscheduled_alignment;
+                }) {
+    return (params.params);
+  } else {
+    return (params);
+  }
+}
+
+template <typename Key>
+decltype(auto) cudnn_cache_key_resource(Key& key) {
+  return cudnn_cache_key_resource_fields(cudnn_cache_key_pod(key));
+}
+
+template <typename Key>
+decltype(auto) cudnn_cache_key_resource(const Key& key) {
+  return cudnn_cache_key_resource_fields(cudnn_cache_key_pod(key));
+}
+
+template <typename Key>
+Key cudnn_cache_key_without_alignment(const Key& key) {
+  Key normalized_key(key);
+  cudnn_cache_key_resource(normalized_key).sm_coscheduled_alignment = 0;
+  return normalized_key;
+}
+
+template <typename Key>
+bool cudnn_cache_key_resource_compatible(
+    const Key& cached_key,
+    const Key& requested_key) {
+  const auto& cached = cudnn_cache_key_resource(cached_key);
+  const auto& requested = cudnn_cache_key_resource(requested_key);
+  if (cached.sm_count != requested.sm_count) {
+    return false;
+  }
+  if (cached.sm_coscheduled_alignment ==
+      requested.sm_coscheduled_alignment) {
+    return true;
+  }
+  if (cached.sm_coscheduled_alignment == 0 ||
+      requested.sm_coscheduled_alignment == 0) {
+    return false;
+  }
+  return cached.sm_coscheduled_alignment %
+      requested.sm_coscheduled_alignment == 0;
+}
 
 // ---------------------------------------------------------------------
 //
@@ -30,6 +121,8 @@ struct ConvolutionParams {
   int64_t groups;
   bool deterministic;
   bool allow_tf32;
+  uint32_t sm_count;
+  uint32_t sm_coscheduled_alignment;
   // NB: transposed purposely omitted: transposed just swaps
   // forward and backward, so you can reuse the benchmark entry,
 };

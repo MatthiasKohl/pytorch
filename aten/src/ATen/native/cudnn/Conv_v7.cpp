@@ -107,27 +107,37 @@ std::ostream& operator<<(std::ostream& out, const ConvolutionArgs& args) {
 // TODO: Use something less heavy duty than a big honking mutex
 template <typename T>
 struct BenchmarkCache {
+  struct CacheEntry {
+    ConvolutionParams key;
+    T result;
+  };
+
   std::mutex mutex;
   std::unordered_map<
       ConvolutionParams,
-      T,
+      CacheEntry,
       ParamsHash<ConvolutionParams>,
       ParamsEqual<ConvolutionParams>>
       map;
 
   bool find(const ConvolutionParams& params, T* results) {
     std::lock_guard<std::mutex> guard(mutex);
-    auto it = map.find(params);
+    auto it = map.find(cudnn_cache_key_without_alignment(params));
     if (it == map.end()) {
       return false;
     }
-    *results = it->second;
+    if (!cudnn_cache_key_resource_compatible(it->second.key, params)) {
+      return false;
+    }
+    *results = it->second.result;
     return true;
   }
 
   void insert(const ConvolutionParams& params, const T& results) {
     std::lock_guard<std::mutex> guard(mutex);
-    map[params] = results;
+    map.insert_or_assign(
+        cudnn_cache_key_without_alignment(params),
+        CacheEntry{params, results});
   }
 };
 

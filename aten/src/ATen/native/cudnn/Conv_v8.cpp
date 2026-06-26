@@ -286,12 +286,22 @@ int getLRUCacheLimit() {
 
 template <typename T, typename KeyType>
 struct BenchmarkCache {
+  struct CacheEntry {
+    CacheEntry(
+        T& result,
+        const KeyType& key,
+        typename std::list<KeyType>::iterator iterator)
+        : result(result), key(key), iterator(iterator) {}
+
+    T result;
+    KeyType key;
+    typename std::list<KeyType>::iterator iterator;
+  };
+
   std::list<KeyType> engine_cache_order;
   std::unordered_map<
       KeyType,
-      std::pair<
-          cudnn_frontend::ExecutionPlan,
-          typename std::list<KeyType>::iterator>,
+      CacheEntry,
       ParamsWrapperHash<KeyType>>
       engine_cache;
 
@@ -303,24 +313,29 @@ struct BenchmarkCache {
     if (lru_cache_limit < 0) {
       return nullptr;
     }
-    auto it = engine_cache.find(key);
+    KeyType normalized_key = cudnn_cache_key_without_alignment(key);
+    auto it = engine_cache.find(normalized_key);
     if (it == engine_cache.end()) {
+      return nullptr;
+    }
+    if (!cudnn_cache_key_resource_compatible(it->second.key, key)) {
       return nullptr;
     }
     if (lru_cache_limit) {
       // update most recently accessed
       engine_cache_order.splice(
-          engine_cache_order.begin(), engine_cache_order, it->second.second);
+          engine_cache_order.begin(), engine_cache_order, it->second.iterator);
     }
-    return &(it->second.first);
+    return &(it->second.result);
   }
 
   void update(const KeyType& key, T& results) {
     int lru_cache_limit = getLRUCacheLimit();
+    KeyType normalized_key = cudnn_cache_key_without_alignment(key);
     if (lru_cache_limit < 0) {
       return;
     } else if (lru_cache_limit) {
-      auto it = engine_cache.find(key);
+      auto it = engine_cache.find(normalized_key);
       if (it == engine_cache.end()) {
         if ((long)engine_cache.size() >= lru_cache_limit) {
           auto erase_count = engine_cache.erase(engine_cache_order.back());
@@ -329,19 +344,25 @@ struct BenchmarkCache {
               "CUDNN V8 LRU Cache Corrupted (eviction key not in map). Please report a bug to PyTorch.");
           engine_cache_order.pop_back();
         }
-        engine_cache_order.emplace_front(key);
-        engine_cache.emplace(
-            key, std::make_pair(results, engine_cache_order.begin()));
+        engine_cache_order.emplace_front(normalized_key);
+        engine_cache.try_emplace(
+            normalized_key, results, key, engine_cache_order.begin());
       } else {
-        it->second.first = results;
+        it->second.result = results;
+        it->second.key = key;
         // update most recently accessed
         engine_cache_order.splice(
-            engine_cache_order.begin(), engine_cache_order, it->second.second);
+            engine_cache_order.begin(), engine_cache_order, it->second.iterator);
       }
     } else {
-      engine_cache.insert_or_assign(
-          key,
-          std::make_pair(results, engine_cache_order.end())); // dummy iterator
+      auto it = engine_cache.find(normalized_key);
+      if (it == engine_cache.end()) {
+        engine_cache.try_emplace(
+            normalized_key, results, key, engine_cache_order.end());
+      } else {
+        it->second.result = results;
+        it->second.key = key;
+      }
     }
   }
 };

@@ -39,6 +39,7 @@ from torch.testing._internal.common_cuda import (
     _create_scaling_case,
     _get_torch_cuda_version,
     blas_library_context,
+    PLATFORM_SUPPORTS_CUDNN_ATTENTION,
     PLATFORM_SUPPORTS_GREEN_CONTEXT,
     PLATFORM_SUPPORTS_WORKQUEUE_CONFIG,
     SM70OrLater,
@@ -10426,6 +10427,32 @@ class TestCudaGreenContexts(TestCase):
     def tearDown(self):
         super().tearDown()
 
+    def _skip_if_no_cuda_stream_resource_query(self):
+        if torch._C._cuda_getCompiledVersion() < 13010:
+            self.skipTest("CUDA 13.1+ is required for stream resource queries")
+        from torch.cuda.green_contexts import _get_driver_version
+
+        if _get_driver_version() < 13010:
+            self.skipTest(
+                "CUDA user mode driver 13.1+ is required for stream resource queries"
+            )
+
+    def _cudnn_resource_test_contexts(self):
+        sms = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        counts = []
+        for count in (max(1, sms // 2), max(1, sms // 3), 1):
+            if count not in counts:
+                counts.append(count)
+        if len(counts) == 1 and sms > 1:
+            counts.append(2)
+        contexts = [
+            torch.cuda.green_contexts.GreenContext(num_sms=count)
+            for count in counts[:2]
+        ]
+        return [(ctx, ctx.Stream()) for ctx in contexts]
+
     def test_greencontext_restores_stream(self):
         # need to start on a side stream as we are comparing pointers and want to avoid
         # two NULL streams...
@@ -10486,6 +10513,83 @@ class TestCudaGreenContexts(TestCase):
         t3 = time.perf_counter()
         self.assertEqual(partial_res, full_res)
         self.assertGreater(t1 - t0, t3 - t2)
+
+    @unittest.skipIf(not TEST_CUDNN, "cuDNN is not available")
+    @serialTest()
+    def test_greencontext_cudnn_convolution_stream_cache_key(self):
+        self._skip_if_no_cuda_stream_resource_query()
+        ctx_streams = self._cudnn_resource_test_contexts()
+
+        x = torch.randn(4, 8, 32, 32, device="cuda")
+        w = torch.randn(16, 8, 3, 3, device="cuda")
+        torch.cuda.synchronize()
+
+        def run_conv():
+            x_local = x.detach().clone().requires_grad_(True)
+            w_local = w.detach().clone().requires_grad_(True)
+            out = torch.nn.functional.conv2d(x_local, w_local, padding=1)
+            out.sum().backward()
+            return out.detach(), x_local.grad.detach(), w_local.grad.detach()
+
+        with torch.backends.cudnn.flags(enabled=True, benchmark=False):
+            full_res = run_conv()
+            full_res_again = run_conv()
+            partial_results = []
+            for _ctx, ctx_stream in ctx_streams:
+                with torch.cuda.stream(ctx_stream):
+                    partial_results.append((run_conv(), run_conv()))
+        torch.cuda.synchronize()
+
+        self.assertEqual(full_res, full_res_again)
+        for partial_res, partial_res_again in partial_results:
+            self.assertEqual(full_res, partial_res)
+            self.assertEqual(partial_res, partial_res_again)
+
+    @unittest.skipIf(not TEST_CUDNN, "cuDNN is not available")
+    @unittest.skipIf(
+        not PLATFORM_SUPPORTS_CUDNN_ATTENTION,
+        "cuDNN attention is not supported",
+    )
+    @serialTest()
+    def test_greencontext_cudnn_sdpa_stream_cache_key(self):
+        self._skip_if_no_cuda_stream_resource_query()
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        ctx_streams = self._cudnn_resource_test_contexts()
+
+        q = torch.randn(2, 4, 128, 64, device="cuda", dtype=torch.float16)
+        k = torch.randn(2, 4, 128, 64, device="cuda", dtype=torch.float16)
+        v = torch.randn(2, 4, 128, 64, device="cuda", dtype=torch.float16)
+        torch.cuda.synchronize()
+
+        def run_sdpa():
+            q_local = q.detach().clone().requires_grad_(True)
+            k_local = k.detach().clone().requires_grad_(True)
+            v_local = v.detach().clone().requires_grad_(True)
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q_local, k_local, v_local, dropout_p=0.0
+            )
+            out.sum().backward()
+            return (
+                out.detach(),
+                q_local.grad.detach(),
+                k_local.grad.detach(),
+                v_local.grad.detach(),
+            )
+
+        with sdpa_kernel(backends=[SDPBackend.CUDNN_ATTENTION]):
+            full_res = run_sdpa()
+            full_res_again = run_sdpa()
+            partial_results = []
+            for _ctx, ctx_stream in ctx_streams:
+                with torch.cuda.stream(ctx_stream):
+                    partial_results.append((run_sdpa(), run_sdpa()))
+        torch.cuda.synchronize()
+
+        self.assertEqual(full_res, full_res_again)
+        for partial_res, partial_res_again in partial_results:
+            self.assertEqual(full_res, partial_res)
+            self.assertEqual(partial_res, partial_res_again)
 
     @serialTest()
     def test_greencontext_graphs(self):

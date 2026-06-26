@@ -11,6 +11,12 @@
 
 #include <ATen/native/cudnn/ConvShared.h>
 
+#include <c10/cuda/CUDAStream.h>
+
+#if !defined(USE_ROCM)
+#include <c10/cuda/driver_api.h>
+#endif
+
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
 #include <ATen/NativeFunctions.h>
@@ -79,6 +85,32 @@ namespace at::native {
 //
 // ---------------------------------------------------------------------
 
+CuDNNStreamResource getCuDNNStreamResource(c10::DeviceIndex device_id) {
+  CuDNNStreamResource resource;
+#if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 13010 && \
+    !defined(_WIN32)
+  auto* driver_api = c10::cuda::DriverAPI::get();
+  if (driver_api->cuStreamGetDevResource_ == nullptr) {
+    return resource;
+  }
+
+  CUdevResource dev_resource{};
+  CUresult status = driver_api->cuStreamGetDevResource_(
+      reinterpret_cast<CUstream>(
+          c10::cuda::getCurrentCUDAStream(device_id).stream()),
+      &dev_resource,
+      CU_DEV_RESOURCE_TYPE_SM);
+  if (status != CUDA_SUCCESS ||
+      dev_resource.type != CU_DEV_RESOURCE_TYPE_SM) {
+    return resource;
+  }
+  resource.sm_count = dev_resource.sm.smCount;
+  resource.sm_coscheduled_alignment =
+      dev_resource.sm.smCoscheduledAlignment;
+#endif
+  return resource;
+}
+
 std::ostream& operator<<(std::ostream& out, const ConvolutionParams& params) {
   out << "ConvolutionParams \n"
       << "    memory_format = " << params.memory_format << '\n'
@@ -89,7 +121,10 @@ std::ostream& operator<<(std::ostream& out, const ConvolutionParams& params) {
       << "    groups = " << params.groups << '\n'
       << "    deterministic = " << (params.deterministic ? "true" : "false")
       << '\n'
-      << "    allow_tf32 = " << (params.allow_tf32 ? "true" : "false") << '\n';
+      << "    allow_tf32 = " << (params.allow_tf32 ? "true" : "false") << '\n'
+      << "    sm_count = " << params.sm_count << '\n'
+      << "    sm_coscheduled_alignment = "
+      << params.sm_coscheduled_alignment << '\n';
 
   return out;
 }
@@ -133,6 +168,10 @@ void setConvolutionParams(
   params->groups = groups;
   params->deterministic = deterministic;
   params->allow_tf32 = allow_tf32;
+  auto stream_resource = getCuDNNStreamResource(params->device_id);
+  params->sm_count = stream_resource.sm_count;
+  params->sm_coscheduled_alignment =
+      stream_resource.sm_coscheduled_alignment;
 }
 
 std::string repro_from_args(const ConvolutionParams& params) {
