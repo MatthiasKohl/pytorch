@@ -24,11 +24,12 @@ from . import (
     is_initialized,
 )
 from ._memory_viz import memory as _memory, segments as _segments
+from ._utils import _check_cuda_bindings, _cuda_bindings_driver as _drv
+from .green_contexts import get_num_locality_domains, is_localization_supported
 
 
 if TYPE_CHECKING:
     from torch.types import Device
-
 
 __all__ = [
     "caching_allocator_alloc",
@@ -59,6 +60,7 @@ __all__ = [
     "list_gpu_processes",
     "mem_get_info",
     "get_allocator_backend",
+    "LocalizedMemPool",
     "CUDAPluggableAllocator",
     "change_current_allocator",
     "MemPool",
@@ -1268,6 +1270,171 @@ def get_allocator_backend() -> str:
     return torch._C._cuda_getAllocatorBackend()
 
 
+_ALLOC_FN = ctypes.CFUNCTYPE(
+    ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p
+)
+_FREE_FN = ctypes.CFUNCTYPE(
+    None, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p
+)
+
+
+def _round_up(x: int, y: int) -> int:
+    return ((x + y - 1) // y) * y
+
+
+def _as_ptr_int(ptr) -> int:
+    if ptr is None:
+        return 0
+    value = getattr(ptr, "value", ptr)
+    if value is None:
+        return 0
+    return int(value)
+
+
+def _make_locality_allocation_prop(device_id: int, locality_domain_id: int):
+    # pyrefly: ignore [missing-attribute]
+    prop = _drv.CUmemAllocationProp()
+    # pyrefly: ignore [missing-attribute]
+    prop.type = _drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.location.type = (
+        # pyrefly: ignore [missing-attribute]
+        _drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE_LOCALITY_DOMAIN
+    )
+    prop.location.localized.deviceId = device_id
+    prop.location.localized.localityDomainId = locality_domain_id
+    return prop
+
+
+def _make_device_access_desc(device_id: int):
+    # pyrefly: ignore [missing-attribute]
+    desc = _drv.CUmemAccessDesc()
+    # pyrefly: ignore [missing-attribute]
+    desc.location.type = _drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+    desc.location.id = device_id
+    # pyrefly: ignore [missing-attribute]
+    desc.flags = _drv.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+    return desc
+
+
+
+class _BaseLocalityAllocator:
+    def __init__(self, device_id: int | None = None) -> None:
+        self.device_id = _get_device_index(device_id, optional=True)
+        if not is_localization_supported(self.device_id):
+            raise RuntimeError(
+                "Green Context localization must be supported on this device "
+                "for localized allocation"
+            )
+        self._records: dict[int, Any] = {}
+        self._alloc_cb = _ALLOC_FN(self._alloc_callback)
+        self._free_cb = _FREE_FN(self._free_callback)
+        alloc_ptr = ctypes.cast(self._alloc_cb, ctypes.c_void_p).value
+        free_ptr = ctypes.cast(self._free_cb, ctypes.c_void_p).value
+        if alloc_ptr is None or free_ptr is None:
+            raise RuntimeError("Failed to create localized allocator callbacks")
+        self.alloc_ptr = alloc_ptr
+        self.free_ptr = free_ptr
+
+    def _alloc_callback(self, size: int, device: int, stream) -> int:
+        try:
+            return self.allocate(size, device, stream)
+        except Exception as e:
+            warnings.warn(f"Localized CUDA allocation failed: {e}")
+            return 0
+
+    def _free_callback(self, ptr, size: int, device: int, stream) -> None:
+        try:
+            self.free(_as_ptr_int(ptr))
+        except Exception as e:
+            warnings.warn(f"Localized CUDA free failed: {e}")
+
+    def allocate(self, size: int, device: int, stream) -> int:
+        raise NotImplementedError
+
+    def free(self, ptr: int) -> None:
+        raise NotImplementedError
+
+    def cuda_allocator(self):
+        return torch._C._cuda_customAllocator(self.alloc_ptr, self.free_ptr)
+
+
+class _DomainLocalityAllocator(_BaseLocalityAllocator):
+    def __init__(self, locality_domain_id: int, device_id: int | None = None) -> None:
+        super().__init__(device_id)
+        num_domains = get_num_locality_domains(self.device_id)
+        if locality_domain_id < 0 or locality_domain_id >= num_domains:
+            raise ValueError(
+                "Invalid locality_domain_id: "
+                f"{locality_domain_id} (device has {num_domains})"
+            )
+        self.locality_domain_id = locality_domain_id
+
+    def allocate(self, size: int, device_id: int, stream) -> int:
+        if size == 0:
+            return 0
+        if device_id != self.device_id:
+            raise RuntimeError(
+                f"Device mismatch. Allocator device: {device_id}, "
+                f"locality device: {self.device_id}"
+            )
+
+        prop = _make_locality_allocation_prop(device_id, self.locality_domain_id)
+        granularity = _check_cuda_bindings(
+            # pyrefly: ignore [missing-attribute]
+            _drv.cuMemGetAllocationGranularity(
+                prop,
+                # pyrefly: ignore [missing-attribute]
+                _drv.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+            )
+        )
+        padded_size = _round_up(size, granularity)
+        handle = None
+        ptr = 0
+        mapped = False
+        try:
+            # pyrefly: ignore [missing-attribute]
+            handle = _check_cuda_bindings(_drv.cuMemCreate(padded_size, prop, 0))
+            ptr = int(
+                _check_cuda_bindings(
+                    # pyrefly: ignore [missing-attribute]
+                    _drv.cuMemAddressReserve(padded_size, granularity, 0, 0)
+                )
+            )
+            # pyrefly: ignore [missing-attribute]
+            _check_cuda_bindings(_drv.cuMemMap(ptr, padded_size, 0, handle, 0))
+            mapped = True
+            desc = _make_device_access_desc(device_id)
+            # pyrefly: ignore [missing-attribute]
+            _check_cuda_bindings(_drv.cuMemSetAccess(ptr, padded_size, [desc], 1))
+            self._records[ptr] = (padded_size, handle)
+            return ptr
+        except Exception:
+            if mapped:
+                # pyrefly: ignore [missing-attribute]
+                _check_cuda_bindings(_drv.cuMemUnmap(ptr, padded_size))
+            if ptr:
+                # pyrefly: ignore [missing-attribute]
+                _check_cuda_bindings(_drv.cuMemAddressFree(ptr, padded_size))
+            if handle is not None:
+                # pyrefly: ignore [missing-attribute]
+                _check_cuda_bindings(_drv.cuMemRelease(handle))
+            raise
+
+    def free(self, ptr: int) -> None:
+        if ptr == 0:
+            return
+        record = self._records.pop(ptr, None)
+        if record is None:
+            return
+        padded_size, handle = record
+        # pyrefly: ignore [missing-attribute]
+        _check_cuda_bindings(_drv.cuMemUnmap(ptr, padded_size))
+        # pyrefly: ignore [missing-attribute]
+        _check_cuda_bindings(_drv.cuMemAddressFree(ptr, padded_size))
+        # pyrefly: ignore [missing-attribute]
+        _check_cuda_bindings(_drv.cuMemRelease(handle))
+
+
 class _CUDAAllocator:
     r"""Wrapper over internal CUDA memory allocators."""
 
@@ -1388,6 +1555,38 @@ class MemPool(_MemPool):
         """
         snapshot = torch.cuda.memory_snapshot(self.id, include_traces=include_traces)
         return snapshot
+
+
+class LocalizedMemPool(MemPool):
+    r"""MemPool whose allocator targets one CUDA locality domain."""
+
+    def __init__(
+        self,
+        locality_domain_id: int,
+        *,
+        device: "Device" = None,
+        use_on_oom: bool = False,
+        no_split: bool = False,
+    ) -> None:
+        self._localized_allocator = _DomainLocalityAllocator(
+            locality_domain_id,
+            _get_device_index(device, optional=True),
+        )
+        self._locality_domain_id = self._localized_allocator.locality_domain_id
+        self._device_id = self._localized_allocator.device_id
+        allocator = self._localized_allocator.cuda_allocator()
+        with torch.cuda.device(self._device_id):
+            super().__init__(allocator, use_on_oom, no_split)
+
+    @property
+    def locality_domain_id(self) -> int:
+        r"""Return the locality domain ID associated with this pool."""
+        return self._locality_domain_id
+
+    @property
+    def device_id(self) -> int:
+        r"""Return the CUDA device index associated with this pool."""
+        return self._device_id
 
 
 @contextlib.contextmanager

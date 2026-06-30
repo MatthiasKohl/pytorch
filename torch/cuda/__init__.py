@@ -1493,6 +1493,11 @@ def _get_amdsmi_device_index(device: Device) -> int:
         return _get_amdsmi_device_index_from_hip_index(idx_map[idx])
 
 
+# Import after _get_nvml_device_index / _get_amdsmi_device_index / _lazy_init exist:
+# memory.py imports those from this package; an early import would circular-import.
+from .memory import LocalizedMemPool
+
+
 def _get_amdsmi_device_memory_used(device: Device = None) -> int:
     handle = _get_amdsmi_handler(device)
     # amdsmi_get_gpu_vram_usage returns mem usage in megabytes
@@ -2086,6 +2091,7 @@ __all__ = [
     "Stream",
     "StreamContext",
     "GreenContext",
+    "LocalizedMemPool",
     "amp",
     "caching_allocator_alloc",
     "caching_allocator_delete",
