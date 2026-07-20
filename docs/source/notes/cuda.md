@@ -897,14 +897,19 @@ receive every logical allocation and completed free directly:
 pool = torch.cuda.MemPool(allocator, allocator_managed=True)
 ```
 
-An allocator used this way must implement three operations. `raw_alloc_with_stream`
-receives the unrounded logical size and allocation stream. `raw_delete` receives each
-returned pointer once all of its recorded-stream dependencies have completed.
-`emptyCache` must release allocator-owned free or cached storage without disturbing
-live allocations; it may be a no-op for a non-caching implementation. Calling
-`torch.cuda.empty_allocator_cache(pool)` drains pending stream events before invoking
-`emptyCache`. The pool must be inactive and must not be retained by a CUDA graph.
-This API is supported only for allocator-managed pools.
+Any `CUDAAllocator` may be supplied. With `allocator_managed=True`, the pool uses the
+allocator's existing operations according to the following contract.
+`raw_alloc_with_stream` receives every unrounded logical size and allocation stream.
+`raw_delete` receives each returned pointer after all of its recorded-stream
+dependencies have completed. The allocator must retain any allocation metadata its
+free implementation needs. `emptyCache` must release allocator-owned free or cached
+storage without disturbing live allocations; it may be a no-op for a non-caching
+implementation. Calling `torch.cuda.empty_allocator_cache(pool)` drains pending
+stream events before invoking `emptyCache`. The pool must be inactive and must not be
+retained by a CUDA graph. `CUDAPluggableManagedPoolAllocator` is a convenience helper
+for supplying allocation, free, and optional cache-emptying function pointers; an
+ordinary `CUDAPluggableAllocator` is also valid. An allocator used in managed mode is
+exclusive to one MemPool and cannot simultaneously back an ordinary custom MemPool.
 
 The custom allocator owns rounding, splitting, coalescing, reuse, backing-memory
 pressure, and cache release. PyTorch bypasses its native free-block search, rounding,
@@ -918,15 +923,31 @@ statistics needed to account for the custom allocator's cache.
 PyTorch still tracks each live allocation and defers frees until its recorded stream
 uses have completed. Native memory snapshots and statistics describe these logical
 allocations; allocator-internal caches are not visible to them. Custom allocator
-callbacks must not reenter PyTorch's CUDA allocator, and must return non-overlapping
-device storage for simultaneously live allocations. `use_on_oom` and `no_split` are
-not supported with `allocator_managed=True`.
+callbacks must be thread-safe, must not reenter PyTorch's CUDA allocator, and must
+return non-overlapping device storage for simultaneously live allocations. Completed
+frees and valid cache-emptying requests must not leave partial allocator state.
+
+Checkpoint consumers additionally require `getCheckpointState` and
+`setCheckpointPoolState`. The returned `AllocatorState` is opaque to the native
+allocator and must be immutable and reusable. It may pin backing resources required
+by a later restore. After PyTorch frees current logical blocks and drains deferred
+frees, `setCheckpointPoolState` must restore the exact pointers, sizes, devices,
+allocation streams, and allocator-internal deletion metadata represented by the
+checkpoint. It must return an empty `CheckpointDelta`: the outer native allocator
+reconstructs its logical blocks, produces the public delta, and installs storage
+deleters. Checkpoint get and restore operations require the pool's workload to be
+quiescent.
+`use_on_oom` and `no_split` are not supported with `allocator_managed=True`.
 
 Allocator-managed pools can be passed explicitly to {class}`torch.cuda.graph` or used
 with {func}`torch.cuda.use_mem_pool` inside graph capture. The custom allocator must
 keep captured addresses valid until the pool is released, including when it receives
-a completed logical free during capture. CUDA Graph Tree checkpoints and CUDA IPC
-export are not supported for allocator-managed pools.
+a completed logical free during capture. CUDA Graph Tree checkpointing requires the
+allocator to implement the checkpoint methods with the exact restoration semantics
+described above. `CUDAPluggableAllocator` and
+`CUDAPluggableManagedPoolAllocator` report that checkpointing is unsupported unless a
+C++ derived allocator overrides those methods. CUDA IPC export is not supported for
+allocator-managed pools.
 
 
 Note the usage of `register_mem_pool` in the above example. This is an extra step for

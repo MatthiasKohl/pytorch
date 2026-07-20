@@ -62,6 +62,7 @@ __all__ = [
     "mem_get_info",
     "get_allocator_backend",
     "LocalizedMemPool",
+    "VMMHalfSplitAllocator",
     "CUDAPluggableAllocator",
     "CUDAPluggableManagedPoolAllocator",
     "change_current_allocator",
@@ -73,6 +74,10 @@ __all__ = [
 if not hasattr(torch._C, "_cuda_CUDAAllocator"):
     # Define dummy base classes
     torch._C.__dict__["_cuda_CUDAAllocator"] = _dummy_type("_cuda_CUDAAllocator")
+
+
+if not hasattr(torch._C, "_VMMHalfSplitAllocator"):
+    torch._C.__dict__["_VMMHalfSplitAllocator"] = _dummy_type("_VMMHalfSplitAllocator")
 
 
 if not hasattr(torch._C, "_MemPool"):
@@ -96,6 +101,7 @@ from torch._C import (  # noqa: F401
     _cuda_endAllocateToPool,
     _cuda_releasePool,
     _MemPool,
+    _VMMHalfSplitAllocator,
 )
 
 
@@ -1655,6 +1661,63 @@ class LocalizedMemPool(MemPool):
     def device_id(self) -> int:
         r"""Return the CUDA device index associated with this pool."""
         return self._device_id
+
+
+class VMMHalfSplitAllocator(MemPool):
+    r"""Allocator-managed MemPool using cached half-split VMM mappings.
+
+    Each allocation's first half is backed by locality domain 0 and its second
+    half by locality domain 1. Mapped ranges and physical allocation handles
+    are cached per stream. Free mapped ranges use unrestricted best-fit reuse.
+
+    This pool requires an NVIDIA CUDA 13 build, a CUDA 13.4 or newer driver,
+    and a device with at least two locality domains. Allocations and accesses
+    are currently limited to the pool's owning device.
+    """
+
+    _vmm_allocator: _VMMHalfSplitAllocator
+
+    def __init__(self, device: "Device" = None) -> None:
+        _lazy_init()
+        device_index = _get_device_index(device, optional=True)
+        with torch.cuda.device(device_index):
+            self._vmm_allocator = _VMMHalfSplitAllocator(device_index)
+            super().__init__(
+                self._vmm_allocator.allocator,
+                allocator_managed=True,
+            )
+
+    def start_recording(self, max_entries: int, *, clear: bool = True) -> None:
+        r"""Start recording VMM mapping and physical-handle events."""
+        self._vmm_allocator.start_recording(max_entries, clear)
+
+    def stop_recording(self) -> None:
+        r"""Stop recording VMM-specific events."""
+        self._vmm_allocator.stop_recording()
+
+    def set_metadata(self, metadata: str) -> None:
+        r"""Attach metadata to subsequently recorded VMM-specific events."""
+        self._vmm_allocator.set_metadata(metadata)
+
+    def vmm_snapshot(self) -> dict[str, Any]:
+        r"""Return VMM mappings, physical-handle stats, and VMM events.
+
+        :meth:`MemPool.snapshot` remains the authoritative logical allocation
+        history, including free requests, completed frees, and stream uses.
+        """
+        return self._vmm_allocator.snapshot()
+
+    def stats(self) -> dict[str, Any]:
+        r"""Return VMM mapping, cache, memory, and CUDA API counters."""
+        return self._vmm_allocator.stats()
+
+    def reset_peak_stats(self) -> None:
+        r"""Reset peak VMM statistics to their current values."""
+        self._vmm_allocator.reset_peak_stats()
+
+    def reset_accumulated_stats(self) -> None:
+        r"""Reset accumulated request, cache, and CUDA API counters."""
+        self._vmm_allocator.reset_accumulated_stats()
 
 
 @contextlib.contextmanager

@@ -1495,7 +1495,7 @@ def _get_amdsmi_device_index(device: Device) -> int:
 
 # Import after _get_nvml_device_index / _get_amdsmi_device_index / _lazy_init exist:
 # memory.py imports those from this package; an early import would circular-import.
-from .memory import LocalizedMemPool
+from .memory import LocalizedMemPool, VMMHalfSplitAllocator
 
 
 def _get_amdsmi_device_memory_used(device: Device = None) -> int:
@@ -2092,6 +2092,7 @@ __all__ = [
     "StreamContext",
     "GreenContext",
     "LocalizedMemPool",
+    "VMMHalfSplitAllocator",
     "amp",
     "caching_allocator_alloc",
     "caching_allocator_delete",

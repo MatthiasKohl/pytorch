@@ -254,6 +254,7 @@ can equally be saved next to a trace and joined offline.
      CUDAPluggableManagedPoolAllocator
      change_current_allocator
      MemPool
+     VMMHalfSplitAllocator
 ```
 
 ```{eval-rst}
