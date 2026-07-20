@@ -37,6 +37,7 @@
 #include <torch/csrc/cuda/CUDAPluggableAllocator.h>
 #include <torch/csrc/cuda/GdsFile.h>
 #include <torch/csrc/cuda/THCP.h>
+#include <torch/csrc/cuda/VMMHalfSplitAllocator.h>
 #include <torch/csrc/cuda/memory_snapshot.h>
 #include <torch/csrc/cuda/python_comm.h>
 #include <torch/csrc/profiler/python/combined_traceback.h>
@@ -2509,6 +2510,7 @@ void initModule(PyObject* module) {
   shared::initGdsBindings(module);
   registerCudaDeviceProperties(module);
   registerCudaPluggableAllocator(module);
+  initVMMHalfSplitAllocatorBindings(module);
   initCudaMethodBindings(module);
 }
 
