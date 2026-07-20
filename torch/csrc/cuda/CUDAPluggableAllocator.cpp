@@ -28,6 +28,14 @@ CUDAPluggableAllocator::CUDAPluggableAllocator(
     std::function<void(void*, size_t, int, cudaStream_t)> free_fn)
     : alloc_fn_(std::move(alloc_fn)), free_fn_(std::move(free_fn)) {}
 
+CUDAPluggableManagedPoolAllocator::CUDAPluggableManagedPoolAllocator(
+    std::function<void*(size_t, int, cudaStream_t)> alloc_fn,
+    std::function<void(void*, size_t, int, cudaStream_t)> free_fn,
+    std::function<void()> empty_cache_fn)
+    : CUDAPluggableAllocator(std::move(alloc_fn), std::move(free_fn)) {
+  reset_fn_ = std::move(empty_cache_fn);
+}
+
 CUDAPluggableAllocator::CUDAPluggableAllocator(CUDAPluggableAllocator& other)
     : alloc_fn_(other.alloc_fn_),
       free_fn_(other.free_fn_),
@@ -384,6 +392,17 @@ createCustomAllocator(
     std::function<void(void*, size_t, int, cudaStream_t)> free_fn) {
   std::shared_ptr<CUDAPluggableAllocator> allocator(
       new CUDAPluggableAllocator(std::move(alloc_fn), std::move(free_fn)));
+  allocator->init(device_count);
+  return allocator;
+}
+
+std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>
+createCustomManagedPoolAllocator(
+    std::function<void*(size_t, int, cudaStream_t)> alloc_fn,
+    std::function<void(void*, size_t, int, cudaStream_t)> free_fn,
+    std::function<void()> empty_cache_fn) {
+  auto allocator = std::make_shared<CUDAPluggableManagedPoolAllocator>(
+      std::move(alloc_fn), std::move(free_fn), std::move(empty_cache_fn));
   allocator->init(device_count);
   return allocator;
 }

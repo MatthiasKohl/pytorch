@@ -19,11 +19,17 @@ TORCH_CUDA_CPP_API std::shared_ptr<
 createCustomAllocator(
     std::function<void*(size_t, int, cudaStream_t)> alloc_fn,
     std::function<void(void*, size_t, int, cudaStream_t)> free_fn);
+TORCH_CUDA_CPP_API std::shared_ptr<
+    c10::cuda::CUDACachingAllocator::CUDAAllocator>
+createCustomManagedPoolAllocator(
+    std::function<void*(size_t, int, cudaStream_t)> alloc_fn,
+    std::function<void(void*, size_t, int, cudaStream_t)> free_fn,
+    std::function<void()> empty_cache_fn);
 TORCH_CUDA_CPP_API void changeCurrentAllocator(
     const std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>&
         allocator);
 
-struct _AllocationMetadata {
+struct TORCH_CUDA_CPP_API _AllocationMetadata {
   _AllocationMetadata();
   _AllocationMetadata(
       size_t size,
@@ -165,5 +171,13 @@ struct TORCH_CUDA_CPP_API CUDAPluggableAllocator
   std::unordered_map<void*, _AllocationMetadata> allocation_metadata_;
 
   bool initialized_ = false;
+};
+
+struct TORCH_CUDA_CPP_API CUDAPluggableManagedPoolAllocator
+    : public CUDAPluggableAllocator {
+  CUDAPluggableManagedPoolAllocator(
+      std::function<void*(size_t, int, cudaStream_t)> alloc_fn,
+      std::function<void(void*, size_t, int, cudaStream_t)> free_fn,
+      std::function<void()> empty_cache_fn);
 };
 } // namespace torch::cuda::CUDAPluggableAllocator

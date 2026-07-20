@@ -1428,6 +1428,31 @@ static void registerCudaPluggableAllocator(PyObject* module) {
     return torch::cuda::CUDAPluggableAllocator::createCustomAllocator(
         malloc_fn, free_fn);
   });
+  m.def(
+      "_cuda_customManagedPoolAllocator",
+      [](uint64_t malloc_ptr, uint64_t free_ptr, uint64_t empty_cache_ptr)
+          -> std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator> {
+        using MallocFuncType = void*(size_t, int, cudaStream_t);
+        using FreeFuncType = void(void*, size_t, int, cudaStream_t);
+        using EmptyCacheFuncType = void();
+        std::function<MallocFuncType> malloc_fn =
+            // NOLINTNEXTLINE(performance-no-int-to-ptr)
+            reinterpret_cast<MallocFuncType*>(malloc_ptr);
+        std::function<FreeFuncType> free_fn =
+            // NOLINTNEXTLINE(performance-no-int-to-ptr)
+            reinterpret_cast<FreeFuncType*>(free_ptr);
+        std::function<EmptyCacheFuncType> empty_cache_fn;
+        if (empty_cache_ptr != 0) {
+          // NOLINTNEXTLINE(performance-no-int-to-ptr)
+          empty_cache_fn =
+              reinterpret_cast<EmptyCacheFuncType*>(empty_cache_ptr);
+        }
+        return torch::cuda::CUDAPluggableAllocator::
+            createCustomManagedPoolAllocator(
+                std::move(malloc_fn),
+                std::move(free_fn),
+                std::move(empty_cache_fn));
+      });
 
   // NOLINTNEXTLINE(bugprone-unused-raii)
   py::class_<

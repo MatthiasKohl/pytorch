@@ -224,6 +224,7 @@ can equally be saved next to a trace and joined offline.
     :nosignatures:
 
      empty_cache
+     empty_allocator_cache
      get_per_process_memory_fraction
      list_gpu_processes
      mem_get_info
@@ -250,6 +251,7 @@ can equally be saved next to a trace and joined offline.
      caching_allocator_delete
      get_allocator_backend
      CUDAPluggableAllocator
+     CUDAPluggableManagedPoolAllocator
      change_current_allocator
      MemPool
 ```

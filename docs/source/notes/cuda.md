@@ -889,6 +889,45 @@ torch.cuda.synchronize()
 print(tensor[0:4])
 ```
 
+By default, the native caching allocator suballocates and caches blocks backed by
+the custom allocator. A custom allocator that implements its own caching can instead
+receive every logical allocation and completed free directly:
+
+```python
+pool = torch.cuda.MemPool(allocator, allocator_managed=True)
+```
+
+An allocator used this way must implement three operations. `raw_alloc_with_stream`
+receives the unrounded logical size and allocation stream. `raw_delete` receives each
+returned pointer once all of its recorded-stream dependencies have completed.
+`emptyCache` must release allocator-owned free or cached storage without disturbing
+live allocations; it may be a no-op for a non-caching implementation. Calling
+`torch.cuda.empty_allocator_cache(pool)` drains pending stream events before invoking
+`emptyCache`. The pool must be inactive and must not be retained by a CUDA graph.
+This API is supported only for allocator-managed pools.
+
+The custom allocator owns rounding, splitting, coalescing, reuse, backing-memory
+pressure, and cache release. PyTorch bypasses its native free-block search, rounding,
+splitting, coalescing, and garbage collection. The native `AllocParams` and
+`alloc_found_block` paths only register the exact-size logical allocation for stream
+safety, tracing, profiling, and statistics, without splitting a remainder. Therefore
+the custom allocator does not need to return policy flags to PyTorch. A richer
+interface would be needed if native memory-pressure policy or physical backing-memory
+statistics needed to account for the custom allocator's cache.
+
+PyTorch still tracks each live allocation and defers frees until its recorded stream
+uses have completed. Native memory snapshots and statistics describe these logical
+allocations; allocator-internal caches are not visible to them. Custom allocator
+callbacks must not reenter PyTorch's CUDA allocator, and must return non-overlapping
+device storage for simultaneously live allocations. `use_on_oom` and `no_split` are
+not supported with `allocator_managed=True`.
+
+Allocator-managed pools can be passed explicitly to {class}`torch.cuda.graph` or used
+with {func}`torch.cuda.use_mem_pool` inside graph capture. The custom allocator must
+keep captured addresses valid until the pool is released, including when it receives
+a completed logical free during capture. CUDA Graph Tree checkpoints and CUDA IPC
+export are not supported for allocator-managed pools.
+
 
 Note the usage of `register_mem_pool` in the above example. This is an extra step for
 NVLS reductions, where the user buffers need to be registered with NCCL. A user can

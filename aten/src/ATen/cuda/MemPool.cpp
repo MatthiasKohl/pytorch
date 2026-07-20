@@ -19,8 +19,18 @@ MemPool::MemPool(
     std::shared_ptr<CUDACachingAllocator::CUDAAllocator> allocator,
     bool is_user_created,
     bool use_on_oom,
-    bool no_split)
+    bool no_split,
+    bool allocator_managed)
     : is_user_created_(is_user_created) {
+  TORCH_CHECK(
+      !allocator_managed || allocator,
+      "allocator_managed=True requires a custom allocator");
+  TORCH_CHECK(
+      !allocator_managed || !use_on_oom,
+      "allocator_managed=True does not support use_on_oom");
+  TORCH_CHECK(
+      !allocator_managed || !no_split,
+      "allocator_managed=True does not support no_split");
   if (is_user_created_) {
     id_ = {0, uid_++};
   } else {
@@ -28,7 +38,7 @@ MemPool::MemPool(
   }
   device_ = c10::cuda::current_device();
   CUDACachingAllocator::createOrIncrefPool(
-      device_, id_, std::move(allocator));
+      device_, id_, std::move(allocator), allocator_managed);
   if (use_on_oom) {
     CUDACachingAllocator::setUseOnOOM(device_, id_, true);
   }
