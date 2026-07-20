@@ -7604,6 +7604,15 @@ class TestMemPool(TestCase):
         extern "C" {
             C10_EXPORT int called_dummy_alloc = 0;
             C10_EXPORT int called_dummy_free = 0;
+            C10_EXPORT int num_dummy_alloc = 0;
+            C10_EXPORT int num_dummy_free = 0;
+            C10_EXPORT size_t last_dummy_alloc_size = 0;
+            C10_EXPORT int num_graph_alloc = 0;
+            C10_EXPORT int num_graph_free = 0;
+            C10_EXPORT int num_graph_reset = 0;
+            C10_EXPORT size_t last_graph_alloc_size = 0;
+            void* graph_cached_ptr = nullptr;
+            size_t graph_cached_size = 0;
 
             // Note that windows needs __declspec(dllexport): https://stackoverflow.com/a/24575865
             C10_EXPORT void* dummy_alloc(size_t size, int device, void* stream) {
@@ -7616,6 +7625,49 @@ class TestMemPool(TestCase):
             C10_EXPORT void dummy_free(void* ptr, size_t size, int device, void* stream) {
             called_dummy_free = 321;
             C10_CUDA_CHECK(cudaFree(ptr));
+            }
+
+            C10_EXPORT void* managed_alloc(size_t size, int device, void* stream) {
+            ++num_dummy_alloc;
+            last_dummy_alloc_size = size;
+            void* ptr;
+            C10_CUDA_CHECK(cudaMallocManaged(&ptr, size));
+            return ptr;
+            }
+
+            C10_EXPORT void managed_free(void* ptr, size_t size, int device, void* stream) {
+            ++num_dummy_free;
+            C10_CUDA_CHECK(cudaFree(ptr));
+            }
+
+            C10_EXPORT void* graph_alloc(size_t size, int device, void* stream) {
+            ++num_graph_alloc;
+            last_graph_alloc_size = size;
+            if (graph_cached_ptr && graph_cached_size >= size) {
+              void* ptr = graph_cached_ptr;
+              graph_cached_ptr = nullptr;
+              graph_cached_size = 0;
+              return ptr;
+            }
+            void* ptr;
+            C10_CUDA_CHECK(cudaMalloc(&ptr, size));
+            return ptr;
+            }
+
+            C10_EXPORT void graph_free(void* ptr, size_t size, int device, void* stream) {
+            ++num_graph_free;
+            TORCH_CHECK(!graph_cached_ptr);
+            graph_cached_ptr = ptr;
+            graph_cached_size = size;
+            }
+
+            C10_EXPORT void graph_reset() {
+            ++num_graph_reset;
+            if (graph_cached_ptr) {
+              C10_CUDA_CHECK(cudaFree(graph_cached_ptr));
+              graph_cached_ptr = nullptr;
+              graph_cached_size = 0;
+            }
             }
         }
         """
@@ -7671,6 +7723,218 @@ class TestMemPool(TestCase):
         del pool
         segments = torch.cuda.memory._snapshot()["segments"]
         self.assertTrue(len(segments) > 0, "expected more than one segment")
+
+    @serialTest()
+    def test_mempool_allocator_managed(self):
+        _, dummy_allocator = self.get_dummy_allocator(check_vars=True)
+        allocator = torch.cuda.memory.CUDAPluggableAllocator(
+            dummy_allocator, "managed_alloc", "managed_free"
+        )
+        alloc_lib = ctypes.CDLL(dummy_allocator)
+        num_alloc = ctypes.c_int.in_dll(alloc_lib, "num_dummy_alloc")
+        num_free = ctypes.c_int.in_dll(alloc_lib, "num_dummy_free")
+        last_size = ctypes.c_size_t.in_dll(alloc_lib, "last_dummy_alloc_size")
+        num_alloc.value = 0
+        num_free.value = 0
+
+        pool = torch.cuda.MemPool(allocator.allocator(), allocator_managed=True)
+        with torch.cuda.use_mem_pool(pool):
+            first = torch.empty(257, dtype=torch.uint8, device="cuda")
+            second = torch.empty(257, dtype=torch.uint8, device="cuda")
+
+        self.assertEqual(num_alloc.value, 2)
+        self.assertEqual(last_size.value, 257)
+        segment_sizes = [segment["total_size"] for segment in pool.snapshot()]
+        self.assertEqual(segment_sizes, [257, 257])
+        with self.assertRaisesRegex(RuntimeError, "IPC is not supported"):
+            first.untyped_storage()._share_cuda_()
+
+        del first, second
+        self.assertEqual(num_free.value, 2)
+
+    @serialTest()
+    def test_mempool_allocator_managed_validation(self):
+        with self.assertRaisesRegex(RuntimeError, "requires a custom allocator"):
+            torch.cuda.MemPool(allocator_managed=True)
+        with self.assertRaisesRegex(TypeError, "pool must be a torch.cuda.MemPool"):
+            torch.cuda.empty_allocator_cache((0, 1))
+        with self.assertRaisesRegex(RuntimeError, "not allocator-managed"):
+            torch.cuda.empty_allocator_cache(torch.cuda.MemPool())
+        with self.assertRaises(TypeError):
+            torch.cuda.empty_cache(pool=torch.cuda.MemPool())
+
+        _, dummy_allocator = self.get_dummy_allocator(check_vars=True)
+        allocator = torch.cuda.memory.CUDAPluggableAllocator(
+            dummy_allocator, "managed_alloc", "managed_free"
+        )
+        with self.assertRaisesRegex(RuntimeError, "does not support use_on_oom"):
+            torch.cuda.MemPool(
+                allocator.allocator(),
+                use_on_oom=True,
+                allocator_managed=True,
+            )
+        with self.assertRaisesRegex(RuntimeError, "does not support no_split"):
+            torch.cuda.MemPool(
+                allocator.allocator(),
+                no_split=True,
+                allocator_managed=True,
+            )
+
+        pool = torch.cuda.MemPool(allocator.allocator(), allocator_managed=True)
+        with self.assertRaisesRegex(RuntimeError, "getCheckpointState"):
+            torch._C._cuda_getCheckpointState(torch.cuda.current_device(), pool.id)
+        with self.assertRaisesRegex(RuntimeError, "only one MemPool"):
+            torch.cuda.MemPool(allocator.allocator(), allocator_managed=True)
+        with self.assertRaisesRegex(RuntimeError, "only one MemPool"):
+            torch.cuda.MemPool(allocator.allocator())
+
+        del pool
+        native_pool = torch.cuda.MemPool(allocator.allocator())
+        second_native_pool = torch.cuda.MemPool(allocator.allocator())
+        with self.assertRaisesRegex(RuntimeError, "only one MemPool"):
+            torch.cuda.MemPool(allocator.allocator(), allocator_managed=True)
+        del native_pool, second_native_pool
+
+        raw_pool = torch._C._MemPool(allocator.allocator(), True, False, False, False)
+        del raw_pool
+
+    @serialTest()
+    def test_mempool_allocator_managed_deferred_free(self):
+        _, dummy_allocator = self.get_dummy_allocator(check_vars=True)
+        allocator = torch.cuda.memory.CUDAPluggableAllocator(
+            dummy_allocator, "managed_alloc", "managed_free"
+        )
+        alloc_lib = ctypes.CDLL(dummy_allocator)
+        num_alloc = ctypes.c_int.in_dll(alloc_lib, "num_dummy_alloc")
+        num_free = ctypes.c_int.in_dll(alloc_lib, "num_dummy_free")
+        num_alloc.value = 0
+        num_free.value = 0
+
+        pool = torch.cuda.MemPool(allocator.allocator(), allocator_managed=True)
+        side_stream = torch.cuda.Stream()
+        with torch.cuda.use_mem_pool(pool):
+            tensor = torch.empty(257, dtype=torch.uint8, device="cuda")
+        tensor.record_stream(side_stream)
+        del tensor
+
+        self.assertEqual(num_free.value, 0)
+        side_stream.synchronize()
+        with torch.cuda.use_mem_pool(pool):
+            tensor = torch.empty(257, dtype=torch.uint8, device="cuda")
+        self.assertEqual(num_alloc.value, 2)
+        self.assertEqual(num_free.value, 1)
+        del tensor
+        self.assertEqual(num_free.value, 2)
+
+    @serialTest()
+    def test_mempool_allocator_managed_empty_cache(self):
+        _, dummy_allocator = self.get_dummy_allocator(check_vars=True)
+        allocator = torch.cuda.CUDAPluggableManagedPoolAllocator(
+            dummy_allocator,
+            "graph_alloc",
+            "graph_free",
+            "graph_reset",
+        )
+        self.assertIsInstance(allocator, torch.cuda.CUDAPluggableAllocator)
+        alloc_lib = ctypes.CDLL(dummy_allocator)
+        alloc_lib.graph_reset.restype = None
+        alloc_lib.graph_reset()
+        num_alloc = ctypes.c_int.in_dll(alloc_lib, "num_graph_alloc")
+        num_free = ctypes.c_int.in_dll(alloc_lib, "num_graph_free")
+        num_reset = ctypes.c_int.in_dll(alloc_lib, "num_graph_reset")
+        num_alloc.value = 0
+        num_free.value = 0
+        num_reset.value = 0
+
+        pool = torch.cuda.MemPool(allocator.allocator(), allocator_managed=True)
+        side_stream = torch.cuda.Stream()
+        with torch.cuda.use_mem_pool(pool):
+            live = torch.ones(257, dtype=torch.uint8, device="cuda")
+            deferred = torch.empty(257, dtype=torch.uint8, device="cuda")
+            with self.assertRaisesRegex(RuntimeError, "only when it is inactive"):
+                torch.cuda.empty_allocator_cache(pool)
+        deferred.record_stream(side_stream)
+        del deferred
+        self.assertEqual(num_alloc.value, 2)
+        self.assertEqual(num_free.value, 0)
+        self.assertEqual(num_reset.value, 0)
+
+        torch.cuda.empty_allocator_cache(pool)
+        self.assertEqual(num_free.value, 1)
+        self.assertEqual(num_reset.value, 1)
+        self.assertEqual(live, torch.ones_like(live))
+
+        del live
+        with torch.cuda.use_mem_pool(pool):
+            tensor = torch.empty(257, dtype=torch.uint8, device="cuda")
+        del tensor
+        torch.cuda.empty_allocator_cache(pool)
+        self.assertEqual(num_alloc.value, 3)
+        self.assertEqual(num_free.value, 3)
+        self.assertEqual(num_reset.value, 2)
+
+    def _test_mempool_allocator_managed_graph(self, nested_pool):
+        _, dummy_allocator = self.get_dummy_allocator(check_vars=True)
+        allocator = torch.cuda.memory.CUDAPluggableManagedPoolAllocator(
+            dummy_allocator,
+            "graph_alloc",
+            "graph_free",
+            "graph_reset",
+        )
+        alloc_lib = ctypes.CDLL(dummy_allocator)
+        alloc_lib.graph_reset.restype = None
+        alloc_lib.graph_reset()
+        num_alloc = ctypes.c_int.in_dll(alloc_lib, "num_graph_alloc")
+        num_free = ctypes.c_int.in_dll(alloc_lib, "num_graph_free")
+        last_size = ctypes.c_size_t.in_dll(alloc_lib, "last_graph_alloc_size")
+        num_alloc.value = 0
+        num_free.value = 0
+
+        pool = torch.cuda.MemPool(allocator.allocator(), allocator_managed=True)
+        graph = torch.cuda.CUDAGraph()
+        torch.cuda.synchronize()
+        if nested_pool:
+            with torch.cuda.graph(graph):
+                with torch.cuda.use_mem_pool(pool):
+                    temporary = torch.empty(257, dtype=torch.uint8, device="cuda")
+                    temporary.fill_(2)
+                    del temporary
+                    output = torch.empty(257, dtype=torch.uint8, device="cuda")
+                    output.fill_(3)
+        else:
+            with torch.cuda.graph(graph, pool=pool):
+                temporary = torch.empty(257, dtype=torch.uint8, device="cuda")
+                temporary.fill_(2)
+                del temporary
+                output = torch.empty(257, dtype=torch.uint8, device="cuda")
+                output.fill_(3)
+
+        self.assertEqual(num_alloc.value, 2)
+        self.assertEqual(num_free.value, 1)
+        self.assertEqual(last_size.value, 257)
+        self.assertEqual(pool.use_count(), 2)
+        with self.assertRaisesRegex(RuntimeError, "not retained by a CUDA graph"):
+            torch.cuda.empty_allocator_cache(pool)
+        graph.replay()
+        self.assertEqual(output, torch.full_like(output, 3))
+        graph.reset()
+        self.assertEqual(pool.use_count(), 1)
+        del output
+        self.assertEqual(num_free.value, 2)
+
+    @unittest.skipIf(
+        not TEST_CUDA_GRAPH, "CUDA >= 11.0 or ROCM >= 5.3 required for graphs"
+    )
+    @serialTest()
+    def test_mempool_allocator_managed_as_graph_pool(self):
+        self._test_mempool_allocator_managed_graph(nested_pool=False)
+
+    @unittest.skipIf(
+        not TEST_CUDA_GRAPH, "CUDA >= 11.0 or ROCM >= 5.3 required for graphs"
+    )
+    @serialTest()
+    def test_mempool_allocator_managed_nested_in_graph(self):
+        self._test_mempool_allocator_managed_graph(nested_pool=True)
 
     @serialTest()
     def test_mempool_empty_cache_inactive(self):

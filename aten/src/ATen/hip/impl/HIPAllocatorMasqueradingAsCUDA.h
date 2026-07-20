@@ -144,8 +144,10 @@ public:
   void createOrIncrefPool(
       c10::DeviceIndex device,
       MempoolId_t mempool_id,
-      std::shared_ptr<HIPAllocator> allocator = nullptr) override {
-    allocator_->createOrIncrefPool(device, mempool_id, std::move(allocator));
+      std::shared_ptr<HIPAllocator> allocator = nullptr,
+      bool allocator_managed = false) override {
+    allocator_->createOrIncrefPool(
+        device, mempool_id, std::move(allocator), allocator_managed);
   }
 
   void setUseOnOOM(c10::DeviceIndex device, MempoolId_t mempool_id, bool use_on_oom) override {

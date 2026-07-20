@@ -171,10 +171,17 @@ class CUDAAllocator : public DeviceAllocator {
         " does not yet support getPoolUseCount. "
         "If you need it, please file an issue describing your use case.");
   }
+  // With allocator_managed=true, the outer allocator forwards every logical
+  // allocation, completed free, and cache-empty request through the supplied
+  // allocator's raw_alloc_with_stream, raw_delete, and emptyCache methods.
+  // Checkpoint support additionally requires getCheckpointState to return
+  // reusable state and setCheckpointPoolState to restore exact addresses and
+  // deletion metadata while returning an empty CheckpointDelta.
   virtual void createOrIncrefPool(
       c10::DeviceIndex /*device*/,
       MempoolId_t /*mempool_id*/,
-      std::shared_ptr<CUDAAllocator> allocator = nullptr) {
+      std::shared_ptr<CUDAAllocator> allocator = nullptr,
+      bool allocator_managed = false) {
     TORCH_CHECK(
         false,
         name(),
@@ -491,9 +498,18 @@ inline void releasePool(c10::DeviceIndex device, MempoolId_t mempool_id) {
 inline void createOrIncrefPool(
     c10::DeviceIndex device,
     MempoolId_t mempool_id,
-    std::shared_ptr<CUDAAllocator> allocator_ptr = nullptr) {
-  get()->createOrIncrefPool(device, mempool_id, std::move(allocator_ptr));
+    std::shared_ptr<CUDAAllocator> allocator_ptr = nullptr,
+    bool allocator_managed = false) {
+  get()->createOrIncrefPool(
+      device, mempool_id, std::move(allocator_ptr), allocator_managed);
 }
+// Drains outstanding stream-event frees and releases cache owned by the custom
+// allocator of an allocator-managed MemPool. This does not release live logical
+// allocations or native allocator cache blocks. The pool must be inactive and
+// not retained by a CUDA graph.
+C10_CUDA_API void emptyAllocatorCache(
+    c10::DeviceIndex device,
+    MempoolId_t mempool_id);
 inline void setUseOnOOM(
     c10::DeviceIndex device,
     MempoolId_t mempool_id,

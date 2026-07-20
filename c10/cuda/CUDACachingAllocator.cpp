@@ -1091,9 +1091,12 @@ struct PrivatePoolState : AllocatorState {
 
   std::vector<SegmentState> segments;
 
+  std::shared_ptr<AllocatorState> managed_allocator_state;
+
   PrivatePoolState(
       MempoolId_t pool_id,
-      const std::vector<Block*>& private_pool_head_blocks);
+      const std::vector<Block*>& private_pool_head_blocks,
+      std::shared_ptr<AllocatorState> managed_allocator_state = nullptr);
 };
 
 struct RestoreResult {
@@ -1220,11 +1223,13 @@ class EventPool {
 struct PrivatePool {
   explicit PrivatePool(
       MempoolId_t id,
-      std::shared_ptr<CUDAAllocator> allocator = nullptr)
+      std::shared_ptr<CUDAAllocator> allocator = nullptr,
+      bool allocator_managed_ = false)
       : id(std::move(id)),
         allocator_(std::move(allocator)),
         large_blocks(/*small=*/false, this),
-        small_blocks(/*small=*/true, this) {}
+        small_blocks(/*small=*/true, this),
+        allocator_managed(allocator_managed_) {}
   PrivatePool(const PrivatePool&) = delete;
   PrivatePool(PrivatePool&&) = delete;
   PrivatePool& operator=(const PrivatePool&) = delete;
@@ -1251,6 +1256,8 @@ struct PrivatePool {
   CUDAAllocator* allocator() {
     return allocator_.get();
   }
+
+  bool allocator_managed{false};
 };
 
 MempoolId_t BlockPool::owner_MempoolId() const {
@@ -1285,8 +1292,10 @@ SegmentState::SegmentState(Block* head) {
 
 PrivatePoolState::PrivatePoolState(
     MempoolId_t pool_id,
-    const std::vector<Block*>& private_pool_head_blocks)
-    : owner_id(std::move(pool_id)) {
+    const std::vector<Block*>& private_pool_head_blocks,
+    std::shared_ptr<AllocatorState> managed_allocator_state)
+    : owner_id(std::move(pool_id)),
+      managed_allocator_state(std::move(managed_allocator_state)) {
   for (Block* head : private_pool_head_blocks) {
     segments.emplace_back(head);
   }
@@ -1674,6 +1683,53 @@ class DeviceCachingAllocator {
   // All public methods (except the above) acquire the allocator mutex.
   // Thus, do not call a public method from another public method.
 
+  Block* registerManagedAllocation(
+      void* ptr,
+      size_t size,
+      cudaStream_t stream,
+      BlockPool& pool,
+      std::shared_ptr<GatheredContext> context) {
+    auto* private_pool = pool.owner_PrivatePool;
+    TORCH_INTERNAL_ASSERT(private_pool && private_pool->allocator_managed);
+
+    private_pool->cudaMalloc_count++;
+    total_allocated_memory += size;
+    auto* block = new Block(device_id, stream, size, &pool, ptr);
+    block->registration_counter =
+        registration_counter_global.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto stat_types = get_stat_types_for_pool(pool);
+    for_each_selected_stat_type(stat_types, [&](size_t stat_type) {
+      stats.segment[stat_type].increase(1);
+      stats.reserved_bytes[stat_type].increase(size);
+      stats.reserved_bytes_by_private_pools[private_pool->id][stat_type]
+          .increase(size);
+    });
+    if (size >= AcceleratorAllocatorConfig::max_split_size()) {
+      stats.oversize_segments.increase(1);
+    }
+    auto reserved_bytes_gauge =
+        STATIC_GAUGE(pytorch.CUDACachingAllocator.reserved_bytes);
+    reserved_bytes_gauge.record(
+        stats.reserved_bytes[static_cast<int64_t>(StatType::AGGREGATE)]
+            .current);
+    stats.num_device_alloc++;
+    record_trace(
+        TraceEntry::SEGMENT_ALLOC,
+        int64_t(ptr),
+        size,
+        stream,
+        device_id,
+        private_pool->id,
+        context);
+    block->context_when_segment_allocated = context;
+
+    AllocParams params(device_id, size, stream, &pool, size, false);
+    params.block = block;
+    params.stat_types = stat_types;
+    return alloc_found_block(
+        params, size, std::move(context), false /* split_remainder */);
+  }
+
   Block* malloc(size_t orig_size, cudaStream_t stream) {
     // done outside the lock because we don't know what locks the recorder needs
     // to have...
@@ -1685,6 +1741,37 @@ class DeviceCachingAllocator {
 
     size_t size = round_size(orig_size);
     auto& pool = get_pool(size, stream);
+    if (C10_UNLIKELY(
+            pool.owner_PrivatePool &&
+            pool.owner_PrivatePool->allocator_managed)) {
+      auto* private_pool = pool.owner_PrivatePool;
+      auto allocator = private_pool->allocator_;
+      lock.unlock();
+      void* ptr = nullptr;
+      try {
+        if (at::cuda::currentStreamCaptureStatusMayInitCtx() ==
+            at::cuda::CaptureStatus::None) {
+          ptr = allocator->raw_alloc_with_stream(orig_size, stream);
+        } else {
+          at::cuda::CUDAStreamCaptureModeGuard capture_guard{
+              cudaStreamCaptureModeRelaxed};
+          ptr = allocator->raw_alloc_with_stream(orig_size, stream);
+        }
+      } catch (...) {
+        lock.lock();
+        throw;
+      }
+      lock.lock();
+      TORCH_CHECK_WITH(
+          OutOfMemoryError,
+          ptr,
+          "CUDA allocator-managed MemPool failed to allocate ",
+          format_size(orig_size));
+
+      return registerManagedAllocation(
+          ptr, orig_size, stream, pool, std::move(context));
+    }
+
     const size_t alloc_size = get_allocation_size(size);
     bool active_user_pool =
         pool.owner_PrivatePool && pool.owner_PrivatePool->allocator();
@@ -1935,6 +2022,9 @@ class DeviceCachingAllocator {
     // Prefix block may have a significantly larger size than requested block
     // when multiple small blocks coalesced into a large prefix block.
     auto& pool = get_pool(size, stream);
+    TORCH_CHECK(
+        !pool.owner_PrivatePool || !pool.owner_PrivatePool->allocator_managed,
+        "Exact-address allocation is not supported for allocator-managed MemPools");
     Block* containing_block =
         get_free_block_containing_address(pool, size, stream, addr);
     if (!containing_block) {
@@ -2372,6 +2462,7 @@ class DeviceCachingAllocator {
     // changed. We store ahead for reporting
     auto orig_block_ptr = block->ptr;
     auto orig_block_size = block->size;
+    auto orig_block_device = block->device;
 
     StatTypes stat_types = get_stat_types_for_pool(*block->pool);
     for_each_selected_stat_type(stat_types, [&](size_t stat_type) {
@@ -2423,7 +2514,7 @@ class DeviceCachingAllocator {
         -static_cast<int64_t>(orig_block_size),
         stats.allocated_bytes[static_cast<size_t>(StatType::AGGREGATE)].current,
         stats.reserved_bytes[static_cast<size_t>(StatType::AGGREGATE)].current,
-        c10::Device(c10::DeviceType::CUDA, block->device));
+        c10::Device(c10::DeviceType::CUDA, orig_block_device));
   }
 
   void free(Block* block) {
@@ -2455,6 +2546,10 @@ class DeviceCachingAllocator {
 
   ShareableHandle shareIpcHandle(Block* block) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
+    TORCH_CHECK(
+        !block->pool->owner_PrivatePool ||
+            !block->pool->owner_PrivatePool->allocator_managed,
+        "CUDA IPC is not supported for allocator-managed MemPools");
     std::ostringstream ss;
     ss.put(SHAREABLE_HANDLE_VERSION);
     ptrdiff_t offset = 0;
@@ -2536,6 +2631,27 @@ class DeviceCachingAllocator {
     auto context = maybeGatherContext(RecordContext::ALL);
     std::lock_guard<std::recursive_mutex> lock(mutex);
     release_cached_blocks(context, mempool_id);
+  }
+
+  void emptyAllocatorCache(MempoolId_t mempool_id) {
+    auto context = maybeGatherContext(RecordContext::ALL);
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    TORCH_CHECK(
+        num_active_captures_ == 0,
+        "An allocator-managed MemPool cannot empty its cache during CUDA "
+        "graph capture");
+    auto it = graph_pools.find(mempool_id);
+    TORCH_CHECK(
+        it != graph_pools.end(), "The allocator-managed MemPool is not live");
+    PrivatePool* pool = it->second.get();
+    TORCH_CHECK(
+        pool->allocator_managed, "The MemPool is not allocator-managed");
+    TORCH_CHECK(
+        pool->use_count == 1,
+        "An allocator-managed MemPool can empty its cache only when it is "
+        "inactive and is not retained by a CUDA graph");
+    synchronize_and_free_events(context, pool);
+    pool->allocator()->emptyCache(mempool_id);
   }
 
   /** Retrieves size of largest unused block held by the memory cache **/
@@ -2632,6 +2748,16 @@ class DeviceCachingAllocator {
     if (pool != graph_pools.end()) {
       auto private_pool_head_blocks =
           get_private_pool_head_blocks(pool->second.get());
+      if (pool->second->allocator_managed) {
+        auto* allocator = pool->second->allocator();
+        auto allocator_state = allocator->getCheckpointState(device_id, id);
+        TORCH_CHECK(
+            allocator_state,
+            "Allocator-managed MemPool allocator returned a null checkpoint "
+            "state");
+        return std::make_unique<PrivatePoolState>(
+            id, private_pool_head_blocks, std::move(allocator_state));
+      }
       return std::make_unique<PrivatePoolState>(id, private_pool_head_blocks);
     } else if (graph_pools_freeable.count(id)) {
       TORCH_CHECK(false, "Not expected to checkpoint freeable graph");
@@ -2640,7 +2766,10 @@ class DeviceCachingAllocator {
     }
   }
 
-  void freeBlocksAllocatedToPool(PrivatePool* private_pool, RestoreResult& rr) {
+  void freeBlocksAllocatedToPool(
+      PrivatePool* private_pool,
+      RestoreResult& rr,
+      const std::function<void(Block*)>& unregister_managed_block) {
     auto pool_blocks = get_private_pool_head_blocks(private_pool);
 
     std::vector<Block*> head_blocks;
@@ -2661,8 +2790,16 @@ class DeviceCachingAllocator {
               curr->event_count == 0,
               "Events should have synchronized when setting checkpointed block");
           rr.allocations_freed.push_back(curr->ptr);
+          if (private_pool->allocator_managed) {
+            unregister_managed_block(curr);
+          }
+          Block* next = curr->next;
           free(curr);
-          TORCH_CHECK(!curr->allocated)
+          if (private_pool->allocator_managed) {
+            curr = next;
+            continue;
+          }
+          TORCH_CHECK(!curr->allocated);
         }
         curr = curr->next;
       }
@@ -2841,7 +2978,9 @@ class DeviceCachingAllocator {
    *                                      |
    *                                      ╰ ---------------> D
    */
-  RestoreResult setCheckpointPoolState(PrivatePoolState& pps) {
+  RestoreResult setCheckpointPoolState(
+      PrivatePoolState& pps,
+      const std::function<void(Block*)>& unregister_managed_block) {
     // To reset the caching allocator state we will
     // - Free all the blocks currently allocated to the pool (see [live tensors
     // between iterations])
@@ -2870,7 +3009,44 @@ class DeviceCachingAllocator {
 
     PrivatePool* private_pool = pool->second.get();
 
-    freeBlocksAllocatedToPool(private_pool, rr);
+    if (private_pool->allocator_managed) {
+      auto* allocator = private_pool->allocator();
+      TORCH_CHECK(
+          pps.managed_allocator_state,
+          "Allocator-managed MemPool checkpoint has no allocator state");
+
+      freeBlocksAllocatedToPool(private_pool, rr, unregister_managed_block);
+      synchronize_and_free_events(context, private_pool);
+      TORCH_INTERNAL_ASSERT(get_private_pool_head_blocks(private_pool).empty());
+
+      (void)allocator->setCheckpointPoolState(
+          device_id, pps.managed_allocator_state);
+      for (const auto& segment : pps.segments) {
+        TORCH_INTERNAL_ASSERT(
+            segment.blocks.size() == 1 && segment.blocks.front().allocated);
+        const auto& block_state = segment.blocks.front();
+        TORCH_INTERNAL_ASSERT(block_state.device == device_id);
+        BlockPool& block_pool = segment.is_small ? private_pool->small_blocks
+                                                 : private_pool->large_blocks;
+        Block* block = registerManagedAllocation(
+            block_state.ptr,
+            block_state.size,
+            block_state.stream,
+            block_pool,
+            context);
+        block->stream_uses = block_state.stream_uses;
+        block->gc_count_base = block_state.gc_count_base;
+        rr.allocations_created.push_back(block);
+      }
+      return rr;
+    }
+
+    TORCH_CHECK(
+        !pps.managed_allocator_state,
+        "Allocator-managed MemPool checkpoint cannot be restored into an "
+        "ordinary MemPool");
+
+    freeBlocksAllocatedToPool(private_pool, rr, unregister_managed_block);
 
     std::unordered_map<void*, Block*> ptrs_to_blocks;
     // at this point, all of the blocks should be free, so they will all be in
@@ -3027,11 +3203,23 @@ class DeviceCachingAllocator {
 
   void createOrIncrefPool(
       MempoolId_t mempool_id,
-      std::shared_ptr<CUDAAllocator> allocator) {
+      std::shared_ptr<CUDAAllocator> allocator,
+      bool allocator_managed) {
     // Create a PrivatePool object if it does not exist yet
     // and increment its use_count
     std::lock_guard<std::recursive_mutex> lock(mutex);
-    create_or_incref_pool(mempool_id, std::move(allocator));
+    create_or_incref_pool(mempool_id, std::move(allocator), allocator_managed);
+  }
+
+  bool usesAllocator(CUDAAllocator* allocator, bool managed_only) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    for (const auto& [_, pool] : graph_pools) {
+      if ((!managed_only || pool->allocator_managed) &&
+          pool->allocator() == allocator) {
+        return true;
+      }
+    }
+    return false;
   }
 
   void setUseOnOOM(MempoolId_t mempool_id, bool use_on_oom) {
@@ -3264,7 +3452,8 @@ class DeviceCachingAllocator {
 
   void create_or_incref_pool(
       MempoolId_t mempool_id,
-      std::shared_ptr<CUDAAllocator> allocator = nullptr) {
+      std::shared_ptr<CUDAAllocator> allocator = nullptr,
+      bool allocator_managed = false) {
     auto it = graph_pools.find(mempool_id);
     if (it == graph_pools.end()) {
       // mempool_id does not reference an existing pool.
@@ -3273,7 +3462,8 @@ class DeviceCachingAllocator {
       // being used since somebody called createOrIncrefPool.
       graph_pools.emplace(
           mempool_id,
-          std::make_unique<PrivatePool>(mempool_id, std::move(allocator)));
+          std::make_unique<PrivatePool>(
+              mempool_id, std::move(allocator), allocator_managed));
     } else {
       // mempool_id references an existing pool, which the current CUDAGraph
       // capture or torch.cuda.use_mem_pool will
@@ -3473,6 +3663,22 @@ class DeviceCachingAllocator {
     size_t requested_size = block->requested_size;
 
     auto& pool = *block->pool;
+    if (C10_UNLIKELY(
+            pool.owner_PrivatePool &&
+            pool.owner_PrivatePool->allocator_managed)) {
+      active_blocks.erase(block);
+      StatTypes stat_types = get_stat_types_for_pool(pool);
+      for_each_selected_stat_type(stat_types, [&](size_t stat_type) {
+        stats.active[stat_type].decrease(1);
+        stats.active_bytes[stat_type].decrease(original_block_size);
+        stats.requested_bytes[stat_type].decrease(requested_size);
+      });
+      bool inserted = pool.insert_into_blocks(block).second;
+      TORCH_INTERNAL_ASSERT(inserted);
+      release_block(block, context);
+      return;
+    }
+
     int64_t net_change_inactive_split_blocks = 0;
     int64_t net_change_inactive_split_size = 0;
 
@@ -4042,6 +4248,9 @@ class DeviceCachingAllocator {
       }
       // See notifyCaptureDestroy for the strategy here.
       TORCH_INTERNAL_ASSERT(it->second->use_count == 0);
+      if (it->second->allocator_managed) {
+        it->second->allocator()->emptyCache(it->first);
+      }
       release_blocks(it->second->small_blocks, context);
       release_blocks(it->second->large_blocks, context);
       if (it->second->cudaMalloc_count == 0) {
@@ -4494,6 +4703,10 @@ class NativeCachingAllocator : public CUDAAllocator {
   std::array<ska::flat_hash_map<const void*, Block*>, kNumMutexShard>
       allocated_blocks;
 
+  // Serializes custom allocator ownership validation and pool creation across
+  // devices.
+  std::mutex allocator_pool_ownership_mutex;
+
   static size_t get_mutex_shard_id(const void* ptr) {
     return twang_mix64(reinterpret_cast<uintptr_t>(ptr)) % kNumMutexShard;
   }
@@ -4892,11 +5105,17 @@ class NativeCachingAllocator : public CUDAAllocator {
 
     TORCH_CHECK(pps, "Expected PrivatePoolState");
 
-    auto rr = device_allocator[device]->setCheckpointPoolState(*pps);
+    auto rr = device_allocator[device]->setCheckpointPoolState(
+        *pps, [this](Block* block) {
+          Block* registered = get_allocated_block(block->ptr, /*remove*/ true);
+          TORCH_INTERNAL_ASSERT(registered == block);
+        });
 
     CheckpointDelta cpd;
     for (void* ptr : rr.allocations_freed) {
-      get_allocated_block(ptr, /*remove*/ true);
+      if (!pps->managed_allocator_state) {
+        get_allocated_block(ptr, /*remove*/ true);
+      }
       cpd.ptrs_freed.push_back(ptr);
     }
     for (Block* block : rr.allocations_created) {
@@ -4994,10 +5213,31 @@ class NativeCachingAllocator : public CUDAAllocator {
   void createOrIncrefPool(
       c10::DeviceIndex device,
       MempoolId_t mempool_id,
-      std::shared_ptr<CUDAAllocator> allocator) override {
+      std::shared_ptr<CUDAAllocator> allocator,
+      bool allocator_managed) override {
     assertValidDevice(device);
+    TORCH_CHECK(
+        !allocator_managed || allocator,
+        "allocator_managed=True requires a custom allocator");
+    if (allocator) {
+      std::lock_guard<std::mutex> lock(allocator_pool_ownership_mutex);
+      for (const auto& device_alloc : device_allocator) {
+        TORCH_CHECK(
+            !device_alloc->usesAllocator(allocator.get(), !allocator_managed),
+            "An allocator used with allocator_managed=True may belong to only "
+            "one MemPool");
+      }
+      device_allocator[device]->createOrIncrefPool(
+          std::move(mempool_id), std::move(allocator), allocator_managed);
+      return;
+    }
     device_allocator[device]->createOrIncrefPool(
-        std::move(mempool_id), std::move(allocator));
+        std::move(mempool_id), std::move(allocator), allocator_managed);
+  }
+
+  void emptyAllocatorCache(c10::DeviceIndex device, MempoolId_t mempool_id) {
+    assertValidDevice(device);
+    device_allocator[device]->emptyAllocatorCache(std::move(mempool_id));
   }
 
   void setUseOnOOM(
@@ -5267,6 +5507,14 @@ void local_raw_delete(void* ptr) {
 }
 
 } // namespace Native
+
+void emptyAllocatorCache(c10::DeviceIndex device, MempoolId_t mempool_id) {
+  TORCH_CHECK(
+      get() == &Native::allocator,
+      "Allocator-managed MemPool cache release requires the native CUDA "
+      "allocator");
+  Native::allocator.emptyAllocatorCache(device, std::move(mempool_id));
+}
 
 namespace CudaMallocAsync {
 // If this is put in its own header file, it gets incorrectly renamed in HIPify.
