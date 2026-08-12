@@ -8,6 +8,11 @@ from cutlass import Float32, Float64, Int32
 import torch
 
 
+# The cute scalar types are re-exported: a caller that reads an element type off this table usually
+# needs to BUILD one too (a boxed Int64 index next to a float compute type), and importing cutlass
+# separately for that would put a second DSL import on the caller's path.
+
+
 # torch dtype -> cute numeric type. Extend as new dtypes are supported.
 torch2cute = {
     torch.float32: Float32,
