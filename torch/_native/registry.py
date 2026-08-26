@@ -472,6 +472,17 @@ def _promotes_with(a: torch.dtype, b: torch.dtype) -> bool:
     return True
 
 
+# Natural precision of each Python number kind, keyed by EXACT type (bool before int,
+# which it subclasses). This is the precision the value is held at, not the promotion
+# result -- see _weak_wrap.
+_NATURAL_SCALAR_DTYPE: dict[type, torch.dtype] = {
+    bool: torch.bool,
+    int: torch.int64,
+    float: torch.float64,
+    complex: torch.complex128,
+}
+
+
 def _weak_wrap(num, tensor_dtypes: list[torch.dtype], cast_dtype: torch.dtype):
     """Wrap a Python number as a 0-d tensor, at natural precision where aten can
     promote it and at ``cast_dtype`` where it cannot.
@@ -487,7 +498,13 @@ def _weak_wrap(num, tensor_dtypes: list[torch.dtype], cast_dtype: torch.dtype):
     a number outside the dtype's range (70000 into uint16) would silently wrap
     around, so we leave those at natural precision and let aten raise as before.
     """
-    nat = torch.as_tensor(num)
+    # dtype EXPLICITLY: torch.as_tensor(2.3) wraps at the DEFAULT dtype (float32), not at a
+    # Python float's natural double, so the value was rounded before it ever reached the
+    # kernel -- torch.fmod(f64_tensor, 2.3) computed with 2.2999999523 and came out ~1e-7
+    # off against numpy (test_fmod_remainder_cuda_float64). A Python float IS a double, an
+    # int is arbitrary-precision (int64 is the wrap aten uses), and bool must be checked
+    # before int since bool subclasses it.
+    nat = torch.as_tensor(num, dtype=_NATURAL_SCALAR_DTYPE[type(num)])
     if all(_promotes_with(nat.dtype, dt) for dt in tensor_dtypes):
         return nat
     narrowed = nat.to(cast_dtype)
