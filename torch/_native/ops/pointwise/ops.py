@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import cutlass.cute as cute
 
+from ...cutedsl import minmax as _mm
+
 
 # ---- op math (module-level named functions; reused/composed freely) ----
 
@@ -46,16 +48,15 @@ def _div(x, y):
 
 @cute.jit
 def _maximum(x, y):
-    # NaN-PROPAGATING max (matches torch.maximum, NOT fmax which suppresses): take y
-    # when it is larger OR is NaN (y != y detects NaN), so a NaN in either operand
-    # propagates. Same form as the reduction AMaxOps._maxnan. (Planned: Blackwell
-    # PTX min/max with the NaN-propagating mode, later.)
-    return y if ((y > x) or (y != y)) else x
+    # NaN-PROPAGATING max (matches torch.maximum, NOT fmax which suppresses). One
+    # instruction on fp32 -- which is every float case, since compute is fp32 -- via
+    # cutedsl/minmax.
+    return _mm.fmax_nan(x, y)
 
 
 @cute.jit
 def _minimum(x, y):
-    return y if ((y < x) or (y != y)) else x
+    return _mm.fmin_nan(x, y)
 
 
 # ---- unary math (INT_TO_FLOAT promotion) ----
@@ -486,13 +487,14 @@ def _rsub(x, y, alpha):
 
 @cute.jit
 def _fmax(x, y):
-    # NaN-SUPPRESSING max (C fmax): if one arg is NaN take the other. y!=y detects NaN.
-    return y if ((y > x) or (x != x)) else x
+    # NaN-SUPPRESSING max (C fmax): if one arg is NaN take the other. Plain PTX max.f32
+    # already does exactly that -- see cutedsl/minmax.
+    return _mm.fmax_suppress_nan(x, y)
 
 
 @cute.jit
 def _fmin(x, y):
-    return y if ((y < x) or (x != x)) else x
+    return _mm.fmin_suppress_nan(x, y)
 
 
 @cute.jit
