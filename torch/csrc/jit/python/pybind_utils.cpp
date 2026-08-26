@@ -611,9 +611,21 @@ py::object toPyObject(IValue ivalue) {
   } else if (ivalue.isTensor()) {
     auto tensor = std::move(ivalue).toTensor();
     if (tensor.unsafeGetTensorImpl()->is_wrapped_number()) {
-      TORCH_INTERNAL_ASSERT(
-          tensor.device().is_cpu() ||
-          (tensor._is_zerotensor() && tensor.dim() == 0));
+      // A wrapped number is a 0-dim tensor standing in for a Python number, so
+      // it is normally unwrapped back into one below -- which reads its storage
+      // on the HOST, and is therefore only valid on CPU (a ZeroTensor is
+      // answered from its dtype alone and needs no storage). But ATen also
+      // creates wrapped numbers on the DEVICE, via
+      // wrapped_scalar_tensor(scalar, device) -- searchsorted does, for one --
+      // and those arrive here whenever a Python kernel is registered for an op
+      // they flow through, because the boxed-to-Python argument conversion goes
+      // through this function. Hand a device scalar back as a Tensor instead:
+      // the value is preserved, no host sync is forced, and the alternative was
+      // dereferencing a device pointer on the host.
+      if (!tensor.device().is_cpu() && !tensor._is_zerotensor()) {
+        return py::cast(std::move(tensor));
+      }
+      TORCH_INTERNAL_ASSERT(tensor.device().is_cpu() || tensor.dim() == 0);
       auto py_tensor = py::cast(tensor);
       if (PyObject_HasAttrString(py_tensor.ptr(), "_wrapped_number")) {
         return py_tensor.attr("_wrapped_number");
