@@ -85,6 +85,18 @@ class PointwiseDef(NamedTuple):
     # cond runs, so it cannot be declined in Python -- the overload must not be
     # registered at all. Functional and in-place still are.
     skip_out_variant: bool = False
+    # EXTRA input precondition from this op's aten meta function, beyond dtype membership
+    # and broadcasting: `(operands, target_or_None) -> bool`, where False means aten would
+    # RAISE, so we must decline and let it. None -> no extra precondition. Two rows need
+    # one, both because they REQUIRE a shared dtype rather than promoting:
+    #   heaviside -- every operand and the out= tensor must share self's dtype
+    #                ("heaviside is not yet implemented for tensors with different
+    #                dtypes", BinaryOps.cpp TORCH_META_FUNC);
+    #   lerp.Tensor -- `end` must match self always, and `weight` unless it is 0-dim,
+    #                which promotes instead (Lerp.cpp TORCH_META_FUNC).
+    # Serving a mismatch returns a value where aten errors, which is the divergence
+    # test_heaviside and test_lerp_weight_tensor_promotion_error catch.
+    precondition: Callable | None = None
     # OPTIONAL scalars: name -> fill-in for the entries of `scalars` that aten declares
     # `Scalar?`/`float?` and the caller may omit INDEPENDENTLY (clamp's min/max,
     # nan_to_num's nan/posinf/neginf, logit's eps). Distinct from scalar_defaults, which
@@ -111,6 +123,15 @@ class PointwiseDef(NamedTuple):
     # differs from its float math (div floor/trunc -- the DSL's `//` floors, and
     # cute.math.floor rejects Int). Maps mode value -> fn name; falls back to mode_fns.
     mode_int_fns: dict | None = None
+    # Modes served for INTEGER compute only. div's floor/trunc derive their quotient from
+    # fmod, whose float form is inexact for a large |x/y| (see ops._fmod and the fmod row),
+    # so a FLOAT rounding-mode divide declines while true division -- which is a plain,
+    # exact division -- and both integer modes keep working.
+    mode_int_only: tuple = ()
+    # Alternate fn for when the LAST operand is a coerced python scalar. Only div needs it:
+    # aten's div.Scalar multiplies by the reciprocal instead of dividing, and
+    # test_division_by_scalar compares the two with atol=0/rtol=0.
+    scalar_fn: str | None = None
 
 
 _DEFAULT = PromotionKind.DEFAULT
@@ -131,6 +152,26 @@ def _lowest(dt):
 
 def _highest(dt):
     return math.inf if dt.is_floating_point else torch.iinfo(dt).max
+
+
+# --- `precondition` predicates (see PointwiseDef.precondition) ---
+
+
+def _all_same_dtype(ins, tgt):
+    # heaviside: every operand, and the out= tensor if there is one, must share self's
+    # dtype -- aten does not promote here, it raises.
+    return all(t.dtype == ins[0].dtype for t in ins) and (
+        tgt is None or tgt.dtype == ins[0].dtype
+    )
+
+
+def _lerp_dtypes_ok(ins, tgt):
+    # lerp.Tensor: `end` must match self; `weight` must too UNLESS it is 0-dim, which
+    # aten promotes instead (promote_weight = weight.dim() == 0).
+    self_, end, weight = ins
+    return self_.dtype == end.dtype and (
+        weight.dim() == 0 or weight.dtype == self_.dtype
+    )
 
 
 class PointwiseVariant(NamedTuple):
@@ -183,7 +224,14 @@ POINTWISE_DEF_TABLE: tuple[PointwiseDef, ...] = (
     # div.Tensor is INT_TO_FLOAT in aten (true division: int/int -> float, and it is
     # this promotion even for float inputs). int_via_float accepts the int input, which
     # then flows the float compute path to a float result.
-    PointwiseDef("div.Tensor", 2, "_div", promotion=_INT2FLOAT, int_via_float=True),
+    PointwiseDef(
+        "div.Tensor",
+        2,
+        "_div",
+        promotion=_INT2FLOAT,
+        int_via_float=True,
+        scalar_fn="_div_recip",
+    ),
     PointwiseDef("maximum", 2, "_maximum", int_dtypes=_INT_DTYPES),
     PointwiseDef("minimum", 2, "_minimum", int_dtypes=_INT_DTYPES),
     PointwiseDef("atan2", 2, "_atan2", promotion=_INT2FLOAT, int_via_float=True),
@@ -199,7 +247,17 @@ POINTWISE_DEF_TABLE: tuple[PointwiseDef, ...] = (
     # cute.math.log/atan (float-only primitives) reject it (copysign's math happens to
     # lower on ints, so it silently returned an integer instead of aten's float32).
     PointwiseDef(
-        "copysign.Tensor", 2, "_copysign", promotion=_INT2FLOAT, int_via_float=True
+        "copysign.Tensor",
+        2,
+        "_copysign",
+        promotion=_INT2FLOAT,
+        int_via_float=True,
+        # NO float16. copysign reads the sign BIT, and compute here is fp32, but widening
+        # an fp16 NaN to fp32 CANONICALISES it and drops that bit (measured: -NaN fp16
+        # widens to 0x7FFFFFFF, a positive NaN -- and ATen's own .float() does the same, so
+        # its fp16 kernel must not go through fp32). bf16 is safe because bf16 -> fp32 is a
+        # shift, which is why only fp16 is excluded. test_copysign_nan_sign covers this.
+        dtypes=(torch.bfloat16, torch.float32, torch.float64),
     ),
     PointwiseDef("hypot", 2, "_hypot"),
     PointwiseDef("logaddexp", 2, "_logaddexp"),
@@ -210,13 +268,28 @@ POINTWISE_DEF_TABLE: tuple[PointwiseDef, ...] = (
     PointwiseDef("pow.Tensor_Tensor", 2, "_pow", skip_out_variant=True),
     # fmod/remainder/floor_divide: integer math differs from float (truncating int
     # division vs cute.math.floor) -> int_fn picks the Int-compute variant.
-    PointwiseDef("fmod.Tensor", 2, "_fmod", int_dtypes=_INT_DTYPES, int_fn="_fmod_int"),
+    # INTEGER ONLY (dtypes=()). The float forms derive everything from fmod, and
+    # x - trunc(x/y)*y loses the low bits the subtraction needs once |x/y| approaches the
+    # mantissa width: fmod(-1e20, 501) gives -6400 against aten's -388. fp64 intermediates
+    # do not rescue it either (the ratio can exceed 2**53 for fp32 inputs too), and a
+    # rearranged formula only moves the error around -- an exact result needs multi-word
+    # reduction, which is a numerics project rather than a formula change. The INTEGER paths
+    # (int_fn) are exact, so they stay. Reference: test_reference_numerics_large_values_fmod.
+    PointwiseDef(
+        "fmod.Tensor",
+        2,
+        "_fmod",
+        int_dtypes=_INT_DTYPES,
+        int_fn="_fmod_int",
+        dtypes=(),
+    ),
     PointwiseDef(
         "remainder.Tensor",
         2,
         "_remainder",
         int_dtypes=_INT_DTYPES,
         int_fn="_remainder_int",
+        dtypes=(),  # integer only, as fmod -- it is fmod plus a sign fixup
     ),
     PointwiseDef(
         "floor_divide",
@@ -224,6 +297,7 @@ POINTWISE_DEF_TABLE: tuple[PointwiseDef, ...] = (
         "_floor_divide",
         int_dtypes=_INT_DTYPES,
         int_fn="_floor_divide_int",
+        dtypes=(),  # integer only: its quotient comes from the same fmod
     ),
     # --- rounding / sign / activation (DEFAULT) ---
     # floor/ceil/trunc are no-ops on integers in aten AND cute.math.floor rejects Int, so
@@ -376,7 +450,13 @@ POINTWISE_DEF_TABLE: tuple[PointwiseDef, ...] = (
     # aten's sinc also accepts complex (we have no DSL complex), so pin the served
     # dtypes to the float set + ints-via-float rather than inheriting the default.
     PointwiseDef("sinc", 1, "_sinc", promotion=_INT2FLOAT, int_via_float=True),
-    PointwiseDef("heaviside", 2, "_heaviside", int_dtypes=_INT_DTYPES),
+    PointwiseDef(
+        "heaviside",
+        2,
+        "_heaviside",
+        int_dtypes=_INT_DTYPES,
+        precondition=_all_same_dtype,
+    ),
     PointwiseDef("logaddexp2", 2, "_logaddexp2"),
     PointwiseDef("special_entr", 1, "_entr", promotion=_INT2FLOAT),
     PointwiseDef(
@@ -416,6 +496,7 @@ POINTWISE_DEF_TABLE: tuple[PointwiseDef, ...] = (
         mode_int_fns={"floor": "_floor_divide_int", "trunc": "_div_trunc_int"},
         mode_promotion={None: _INT2FLOAT, "floor": _DEFAULT, "trunc": _DEFAULT},
         int_dtypes=_INT_DTYPES,
+        mode_int_only=("floor", "trunc"),
     ),
     # clamp: BOTH bounds optional and independently omittable. An omitted bound fills
     # with the matching infinity, so the one NaN-propagating formula covers every arity.
@@ -442,7 +523,7 @@ POINTWISE_DEF_TABLE: tuple[PointwiseDef, ...] = (
         },
     ),
     PointwiseDef("lerp.Scalar", 2, "_lerp", scalars=("weight",)),
-    PointwiseDef("lerp.Tensor", 3, "_lerp"),
+    PointwiseDef("lerp.Tensor", 3, "_lerp", precondition=_lerp_dtypes_ok),
 )
 
 

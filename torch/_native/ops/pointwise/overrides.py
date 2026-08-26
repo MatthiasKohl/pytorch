@@ -185,16 +185,39 @@ def _mode_fn_and_promotion(row: PointwiseDef, args, kwargs, int_compute=False):
 _promo_cache: dict = {}
 
 
+def _promo_key(ins):
+    """Per-operand (dtype, is-0-dim) -- the key aten's promotion actually depends on.
+
+    aten's elementwise promotion has THREE tiers, in increasing strength: a Python number,
+    a 0-DIM tensor, and a tensor of dim >= 1. Within a category the weaker tiers do NOT
+    pull the result up to their own dtype, so a float32 (5,) tensor with a float64 0-dim
+    tensor promotes to FLOAT32 (test_type_promotion's "float x float scalar tensor" case).
+    Probing every operand as 1-D erased that distinction and made it float64.
+    """
+    return tuple((t.dtype, t.dim() == 0) for t in ins)
+
+
 def _result_dtypes(row: PointwiseDef, in_dtypes, promotion=None):
     # promotion overrides row.promotion for mode-selected rows (div's rounding_mode
     # changes the rule: None is true division -> INT_TO_FLOAT, floor/trunc -> DEFAULT).
+    # in_dtypes is a _promo_key tuple, so the probes reproduce each operand's TIER.
     promotion = row.promotion if promotion is None else promotion
-    got = _promo_cache.get((promotion, in_dtypes))
+    # The DEFAULT DTYPE is part of the key: an INT_TO_FLOAT promotion resolves to it, so
+    # int32 / int32 is float32 normally and float64 under set_default_dtype(torch.double).
+    # Without it in the key the first answer is memoized and reused under the other setting
+    # (test_div_rounding_numpy sets double and got float32 back).
+    key = (promotion, in_dtypes, torch.get_default_dtype())
+    got = _promo_cache.get(key)
     if got is None:
-        probes = [torch.empty(0, dtype=d, device="cuda") for d in in_dtypes]
+        probes = [
+            torch.empty((), dtype=d, device="cuda")
+            if zero_dim
+            else torch.empty(0, dtype=d, device="cuda")
+            for d, zero_dim in in_dtypes
+        ]
         compute, result = elementwise_dtypes(*probes, type_promotion_kind=promotion)
         got = (compute, result)
-        _promo_cache[(promotion, in_dtypes)] = got
+        _promo_cache[key] = got
     return got
 
 
@@ -226,7 +249,9 @@ def _make_cond(row: PointwiseDef, variant):
     # dtypes the row opts into -- int_dtypes (integer-in/integer-out ops) or _INT_DTYPES
     # when int_via_float (int input promotes to a float result, served by the float path).
     # See table.PointwiseDef. bool stays excluded (no bool arithmetic; neg(bool) raises).
-    base = row.dtypes or _SUPPORTED
+    # `is None`, not falsy: an EMPTY row.dtypes means "no float dtypes at all", which is how
+    # the inexact-float rows (fmod/remainder/floor_divide) stay integer-only.
+    base = _SUPPORTED if row.dtypes is None else row.dtypes
     ints = row.int_dtypes or (_INT_DTYPES if row.int_via_float else ())
     dtypes = tuple(base) + tuple(ints)
 
@@ -251,6 +276,11 @@ def _make_cond(row: PointwiseDef, variant):
             fn_name, promotion = _mode_fn_and_promotion(row, args, kwargs)
             if fn_name is None:
                 return False  # mode we do not serve (or invalid) -> aten
+            # Modes whose FLOAT math is inexact (div floor/trunc, via fmod) serve integer
+            # compute only; a float operand declines so aten's exact kernel runs.
+            if row.mode_int_only and _mode_of(row, args, kwargs) in row.mode_int_only:
+                if any(t.dtype.is_floating_point for t in ins):
+                    return False
         # A 0-d CPU operand is aten's coerced python number (registry's
         # _scalar_arg_coercer wraps x*2.0's 2.0 at the weak-promotion dtype); the impl
         # moves it onto the device. A dim>0 CPU tensor is a genuine cross-device call
@@ -264,6 +294,11 @@ def _make_cond(row: PointwiseDef, variant):
         except RuntimeError:
             return False  # incompatible -> aten raises the precise size-mismatch error
         tgt = _out_tensor(variant, row, args, kwargs)
+        # The row's own aten meta precondition (a shared-dtype requirement rather than
+        # promotion -- heaviside, lerp.Tensor). False means aten RAISES, so decline and
+        # let it produce the message; serving would return a value instead of an error.
+        if row.precondition is not None and not row.precondition(ins, tgt):
+            return False
         if variant.out_from != "alloc":
             # 16-byte alignment is required of the TARGET as well as the inputs: the
             # vec/rowvec wraps promise assumed_align=16 and from_dlpack VALIDATES it
@@ -291,9 +326,7 @@ def _make_cond(row: PointwiseDef, variant):
             if tgt.dtype not in _CONV_SRC_DTYPES:
                 return False
             # Safe-cast gate: promotion result must fit the target dtype (else aten raises).
-            _, result_dtype = _result_dtypes(
-                row, tuple(t.dtype for t in ins), promotion
-            )
+            _, result_dtype = _result_dtypes(row, _promo_key(ins), promotion)
             if not torch.can_cast(result_dtype, tgt.dtype):
                 return False
         if variant.shape_rule == "eq_self":
@@ -405,7 +438,8 @@ def _make_impl(row: PointwiseDef, variant):
 
     def impl(*args, **kwargs):
         ins = _localize_scalars(args[: row.nin])
-        in_dtypes = tuple(t.dtype for t in ins)
+        # (dtype, is-0-dim) per operand: the promotion tier, and part of the kernel key.
+        in_dtypes = _promo_key(ins)
         # Mode rows pick their fn (and possibly promotion) from a string kwarg; the
         # cond already verified the mode is one we serve.
         fn_override, promotion = (
@@ -413,6 +447,9 @@ def _make_impl(row: PointwiseDef, variant):
             if row.mode_kwarg is not None
             else (None, None)
         )
+        # A python-scalar divisor takes aten's reciprocal-multiply path (see scalar_fn).
+        if row.scalar_fn is not None and _is_wrapped_scalar(args[row.nin - 1]):
+            fn_override = row.scalar_fn
         # Optional scalars fill in from the RESULT dtype, so resolve promotion first.
         # Result, not compute: aten saturates nan_to_num at the OUTPUT dtype's finite
         # max (fp16 -> 65504), while compute for a half input is fp32, whose max would

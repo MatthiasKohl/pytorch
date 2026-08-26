@@ -14,8 +14,9 @@
 from __future__ import annotations
 
 import cutlass.cute as cute
+from cutlass import const_expr, Float32, Float64
 
-from ...cutedsl import minmax as _mm
+from ...cutedsl import fpbits as _fpbits, minmax as _mm
 
 
 # ---- op math (module-level named functions; reused/composed freely) ----
@@ -44,6 +45,16 @@ def _sub(x, y, alpha):
 @cute.jit
 def _div(x, y):
     return x / y
+
+
+@cute.jit
+def _div_recip(x, y):
+    # x * (1/y), for a PYTHON SCALAR divisor. aten's div.Scalar multiplies by the reciprocal
+    # rather than dividing, and test_division_by_scalar asserts the two agree BIT for bit
+    # (atol=0, rtol=0), which they do not: measured 326/1024 elements apart. Computing 1/y
+    # per element costs nothing extra here (y is the same value everywhere, so it is one
+    # reciprocal in the loop) and rounds identically to aten's single host-side one.
+    return x * (x.__class__(1.0) / y)
 
 
 @cute.jit
@@ -193,10 +204,16 @@ def _rad2deg(x):
 
 @cute.jit
 def _logaddexp(x, y):
-    # log(e^x + e^y) = max + log1p(e^-|x-y|), the standard overflow-safe form.
+    # log(e^x + e^y) = max + log1p(e^-|x-y|), the standard overflow-safe form -- plus the
+    # exception aten codes explicitly (`if (std::isinf(a0) && a0 == b0) return a0`, see
+    # BinaryOpsKernel.cpp logaddexp_kernel): for two EQUAL infinities the difference is
+    # inf - inf = NaN, which poisons the formula, so return that infinity. Both signs:
+    # logaddexp(inf, inf) = inf and logaddexp(-inf, -inf) = -inf.
     d = x - y if x > y else y - x
     m = x if x > y else y  # noqa: FURB136 -- builtin max() does not lower in the DSL
-    return m + cute.math.log(x.__class__(1.0) + cute.math.exp(-d))
+    inf = x.__class__(float("inf"))
+    same_inf = (x == y) and ((x == inf) or (x == -inf))
+    return m if same_inf else m + cute.math.log(x.__class__(1.0) + cute.math.exp(-d))
 
 
 @cute.jit
@@ -224,20 +241,41 @@ def _pow(x, y):
     # Full float pow via exp2(y*log2|x|) plus the sign/edge dance:
     #   x>0            -> exp2(y*log2 x)
     #   x<0, y int     -> sign(-1^y) * exp2(y*log2|x|)   (odd y -> negative)
-    #   x<0, y non-int -> nan  (injected via 0/0)
-    #   y==0           -> 1 (any x, incl. 0 and nan-base? aten: pow(x,0)=1 always)
-    #   x==0           -> exp2(y * -inf) = 0 (y>0) / inf (y<0), correct via the mag path.
+    #   x<0, y non-int -> nan, but ONLY for a finite base: C says pow(-inf, 0.5) is +inf
+    #   x==+-0         -> exp2(y * -inf) = 0 (y>0) / inf (y<0) via the mag path, with the
+    #                     ZERO's sign for an odd y -- so "base is negative" must be the sign
+    #                     BIT (fpbits.signbit), since -0.0 < 0 is false and pow(-0.0, -1)
+    #                     is -inf.
+    # And three C rules the formula cannot express, each verified against aten over every
+    # pair of {nan, +-inf, +-0, +-1, +-2, +-0.5, 3}:
+    #   pow(x, +-0) == 1 for any x, even nan;
+    #   pow(+1, y) == 1 for any y, even nan;
+    #   pow(x, +-inf) == 1 whenever |x| == 1 (so pow(-1, inf) is 1, not nan).
     z = x.__class__(0.0)
     one = x.__class__(1.0)
     two = x.__class__(2.0)
-    ax = x if x >= z else -x
-    mag = cute.math.exp2(y * cute.math.log2(ax))
+    inf = x.__class__(float("inf"))
+    ax = x.__class__(cute.math.absf(x))  # wrapped: absf yields a raw ArithValue
+    # The magnitude in DOUBLE when compute is fp32. exp2(y * log2|x|) evaluated in fp32
+    # rounds the product to 24 bits, which is about 1 ulp of the exponent argument and
+    # lands the result ~1e-7 out -- measured pow(3, 3) = 27.000002 and 2**-0.5 wrong in the
+    # 7th digit. aten's powf is correctly rounded and the reference tests compare against a
+    # float64 numpy reference, so the composite has to carry more bits than the result
+    # keeps. fp64 compute (fp64 inputs) already has the headroom.
+    if const_expr(x.__class__ is Float32):
+        mag = Float32(cute.math.exp2(Float64(y) * cute.math.log2(Float64(ax))))
+    else:
+        mag = cute.math.exp2(y * cute.math.log2(ax))
     y_int = y == cute.math.floor(y)
     y_odd = y_int and (cute.math.floor(y * x.__class__(0.5)) * two != y)
-    signed = -mag if ((x < z) and y_odd) else mag
-    nan_val = x.__class__(float("nan"))  # for the invalid neg-base^non-int case
-    r = nan_val if ((x < z) and (not y_int)) else signed
-    return one if y == z else r
+    x_neg = _fpbits.signbit(x)
+    signed = -mag if (x_neg and y_odd) else mag
+    nan_val = x.__class__(float("nan"))
+    # The nan rule is for a negative base that is neither zero nor infinite: pow(-0.0, 0.5)
+    # is +0.0 and pow(-inf, 0.5) is +inf, both of which the magnitude path already gets.
+    r = nan_val if (x_neg and (ax != inf) and (ax != z) and (not y_int)) else signed
+    unit = (y == z) or (x == one) or (((y == inf) or (y == -inf)) and (ax == one))
+    return one if unit else r
 
 
 @cute.jit
@@ -530,41 +568,46 @@ def _lerp(x, y, w):
 
 @cute.jit
 def _copysign(x, y):
-    # |x| with y's sign bit. cute.math.copysign needs CTK>=13, so branch on y with a
-    # signed-zero-correct test: 1/y < 0 catches y = -0.0 (1/-0.0 = -inf).
-    z = x.__class__(0.0)
-    one = x.__class__(1.0)
-    a = x if x >= z else -x
-    y_neg = (y < z) or ((y == z) and (one / y < z))
-    return -a if y_neg else a
+    # |x| with y's sign BIT -- see cutedsl/fpbits. The comparison this used to do got two
+    # cases wrong: |-0.0| stayed negative (so both branches flipped sign), and a NaN's sign
+    # is invisible to a comparison.
+    return _fpbits.copysign(x, y)
 
 
 @cute.jit
 def _fmod(x, y):
-    # C fmod: x - trunc(x/y)*y, result sign follows x.
+    # C fmod: x - trunc(x/y)*y, result sign follows x. Two edges the bare formula gets
+    # wrong, both verified against aten over every pair of {nan, +-inf, +-0, +-1, +-2,
+    # +-0.5, +-3}:
+    #   * an INFINITE divisor makes x/y zero, and 0 * inf is NaN, poisoning a result C
+    #     defines as x itself (fmod(x, +-inf) == x for finite x). An infinite DIVIDEND, and
+    #     y == 0, stay NaN -- which the formula already gives.
+    #   * a ZERO result must carry the DIVIDEND's sign, and the subtraction loses it:
+    #     -0.0 - -0.0 is +0.0, so fmod(-0.0, 1.0) came out +0.0 instead of -0.0.
     #
-    # KNOWN LIMIT: this loses accuracy once |x/y| approaches the mantissa width,
-    # because trunc(x/y)*y rounds away the low bits that the subtraction needs --
-    # fmod(-1e20, 501) gives -6400 where aten (libm, exact multi-word reduction)
-    # gives -388. Routing through _remainder's floor-remainder does NOT help: it
-    # trades these for a larger number of small fp32 diffs (measured 34 -> 81
-    # divergent OpInfo samples). A real fix needs exact reduction, not a rearranged
-    # formula.
+    # KNOWN LIMIT: this loses accuracy once |x/y| approaches the mantissa width, because
+    # trunc(x/y)*y rounds away the low bits the subtraction needs -- fmod(-1e20, 501) gives
+    # -6400 where aten (libm, exact multi-word reduction) gives -388. Rearranging does not
+    # help, and fp64 intermediates do not either: the ratio there exceeds 2**53 as well. A
+    # real fix needs exact reduction, so the FLOAT rows decline (see table.py).
+    z = x.__class__(0.0)
+    inf = x.__class__(float("inf"))
     q = x / y
-    z = q.__class__(0.0)
     tq = cute.math.floor(q) if q >= z else -cute.math.floor(-q)
-    return x - tq * y
+    mod = x - tq * y
+    ax = x.__class__(cute.math.absf(x))
+    ay = x.__class__(cute.math.absf(y))
+    mod = x if ((ay == inf) and (ax != inf)) else mod
+    return _fpbits.copysign(mod, x) if mod == z else mod
 
 
 @cute.jit
 def _remainder(x, y):
-    # Python %, result sign follows y. NOT x - floor(x/y)*y: that loses the identity
-    # when x/y rounds across an integer (see _floor_divide). aten's remainder_cuda is
-    # fmod plus a single sign fixup -- fmod is exact, so this is too.
+    # Python %, result sign follows y: fmod plus a single sign fixup, which is what aten's
+    # remainder_cuda does. Sharing _fmod keeps both on the same edge handling -- a zero
+    # result already carries the right sign there, and the fixup leaves it alone.
     z = x.__class__(0.0)
-    q = x / y
-    tq = cute.math.floor(q) if q >= z else -cute.math.floor(-q)
-    mod = x - tq * y  # fmod(x, y): sign follows x
+    mod = _fmod(x, y)
     return mod + y if (mod != z) and ((y < z) != (mod < z)) else mod
 
 
@@ -598,17 +641,16 @@ def _floor_divide(x, y):
     # b == 0 keeps the plain IEEE result (inf/nan), as aten does.
     z = x.__class__(0.0)
     q = x / y
-    tq = cute.math.floor(q) if q >= z else -cute.math.floor(-q)
-    mod = x - tq * y  # fmod(x, y): sign follows x
+    mod = _fmod(
+        x, y
+    )  # shared, so the +-inf divisor and zero-sign edges are handled once
     div = (x - mod) / y
     div = div - x.__class__(1.0) if (mod != z) and ((y < z) != (mod < z)) else div
     fd = cute.math.floor(div)
     fd = fd + x.__class__(1.0) if (div - fd) > x.__class__(0.5) else fd
-    # div == 0 -> signed zero carrying q's sign (cute.math.copysign needs CTK>=13, so
-    # negate manually; 1/q < 0 catches q == -0.0).
-    one = x.__class__(1.0)
-    q_neg = (q < z) or ((q == z) and (one / q < z))
-    snapped = fd if div != z else (-z if q_neg else z)
+    # div == 0 -> a signed zero carrying q's sign, exactly aten's
+    # C10_COMPAT_COPYSIGN(0, a / b).
+    snapped = fd if div != z else _fpbits.copysign(z, q)
     return q if y == z else snapped
 
 
@@ -848,11 +890,13 @@ def _heaviside(x, y):
 
 @cute.jit
 def _logaddexp2(x, y):
-    # log2(2^x + 2^y), overflow-safe: m + log2(1 + 2^-|x-y|). Base-2 twin of the
-    # covered _logaddexp.
+    # log2(2^x + 2^y), overflow-safe: m + log2(1 + 2^-|x-y|). Base-2 twin of _logaddexp,
+    # including its equal-infinities exception.
     d = x - y if x > y else y - x
     m = x if x > y else y  # noqa: FURB136 -- builtin max() does not lower in the DSL
-    return m + cute.math.log2(x.__class__(1.0) + cute.math.exp2(-d))
+    inf = x.__class__(float("inf"))
+    same_inf = (x == y) and ((x == inf) or (x == -inf))
+    return m if same_inf else m + cute.math.log2(x.__class__(1.0) + cute.math.exp2(-d))
 
 
 @cute.jit
