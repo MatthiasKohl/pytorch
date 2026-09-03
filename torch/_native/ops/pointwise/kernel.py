@@ -845,7 +845,7 @@ def _build_plan(
     compiled = cached_plan(
         _KERNELS,
         kkey,
-        lambda: _L.compile(op, cin, cout, seed_consts, _L.stream()),
+        lambda: _L.compile_kernel(op, cin, cout, seed_consts, _L.stream()),
         op=op_name,
     )
     return _Plan(path, shape, V, tuple(out_dtypes), compiled, rowgap)

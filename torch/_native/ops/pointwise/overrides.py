@@ -43,6 +43,9 @@ else:
     ops = LazyModule("torch._native.ops.pointwise.ops")
 
 
+# Compute-capability majors this family's kernels have been run on: Hopper and Blackwell.
+_ARCH_MAJORS = (9, 10)
+
 _SUPPORTED = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 
 
@@ -267,7 +270,7 @@ def _make_cond(row: PointwiseDef, variant):
         ref = _device_ref(ins)
         if ref is None:  # every operand is a coerced scalar -> nothing to compute on
             return False
-        if not (cap.device_ok(ref) and cap.on_current_device(ref)):
+        if not (cap.device_ok(ref, _ARCH_MAJORS) and cap.on_current_device(ref)):
             return False
         if any(isinstance(s, complex) for s in _scalars(row, args, kwargs)):
             return False
@@ -507,7 +510,7 @@ def _conv_serveable(src, dst_dtype):
         _supported(src, _CONV_SRC_DTYPES)
         and dst_dtype in _CONV_DTYPES + (torch.bool,)
         and not (dst_dtype is torch.bool and src.dtype is torch.bool)
-        and cap.device_ok(src)
+        and cap.device_ok(src, _ARCH_MAJORS)
         and cap.on_current_device(src)
     )
 
@@ -691,7 +694,7 @@ def _fill_cond(self, value):
         and not self.is_neg()
         and not self.is_conj()
         and not cap.is_traced(self)
-        and cap.device_ok(self)
+        and cap.device_ok(self, _ARCH_MAJORS)
         and cap.on_current_device(self)
     )
 
@@ -762,7 +765,7 @@ def _range_out_serveable(out) -> bool:
         and not out.is_neg()
         and not out.is_conj()
         and not cap.is_traced(out)
-        and cap.device_ok(out)
+        and cap.device_ok(out, _ARCH_MAJORS)
         and cap.on_current_device(out)
     )
 

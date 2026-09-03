@@ -35,6 +35,9 @@ else:
 # so they are added one at a time rather than assumed.
 _DTYPES = (torch.float32,)
 
+# Compute-capability majors this family's kernels have been run on: Hopper and Blackwell.
+_ARCH_MAJORS = (9, 10)
+
 
 def _serveable(self) -> bool:
     # A default generator only: an explicit `generator=` argument means a non-default
@@ -47,7 +50,7 @@ def _serveable(self) -> bool:
         and not self.is_neg()
         and not self.is_conj()
         and not cap.is_traced(self)
-        and cap.device_ok(self)
+        and cap.device_ok(self, _ARCH_MAJORS)
         and cap.on_current_device(self)
     )
 
