@@ -12264,6 +12264,58 @@ class TestCudaGreenContexts(TestCase):
         full_res = torch.matmul(a, a)
         self.assertEqual(partial_res, full_res)
 
+    @serialTest()
+    def test_greencontext_num_sms_split(self):
+        from torch.cuda import green_contexts
+
+        device_id = torch.cuda.current_device()
+        drv_device = green_contexts._check_cuda_bindings(
+            green_contexts._drv.cuDeviceGet(device_id)
+        )
+        sm_resource = green_contexts._check_cuda_bindings(
+            green_contexts._drv.cuDeviceGetDevResource(
+                drv_device,
+                green_contexts._drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
+            )
+        )
+        group_size = max(
+            sm_resource.sm.minSmPartitionSize,
+            sm_resource.sm.smCoscheduledAlignment,
+        )
+        if sm_resource.sm.smCount <= 3 * group_size:
+            self.skipTest("Device does not have enough SMs for two resource groups")
+
+        sm_counts = (group_size, 2 * group_size)
+        remainder_count = sm_resource.sm.smCount - sum(sm_counts)
+        expected_counts = (*sm_counts, remainder_count)
+        contexts = [
+            green_contexts.GreenContext.create(
+                num_sms_split=(sm_counts, group_index), device_id=device_id
+            )
+            for group_index in range(len(expected_counts))
+        ]
+        for context, expected_count in zip(contexts, expected_counts):
+            self.assertEqual(context.sm_count, expected_count)
+
+    @parametrize(
+        "num_sms_split,error",
+        [
+            (((), 0), "at least one group"),
+            (((1,), -1), "group index"),
+            (((1,), 2), "group index"),
+            (((1,), True), "group index must be an integer"),
+            (((0,), 0), "Invalid number of SMs"),
+            (((True,), 0), "Invalid number of SMs"),
+        ],
+    )
+    def test_greencontext_invalid_num_sms_split(self, num_sms_split, error):
+        with self.assertRaisesRegex(RuntimeError, error):
+            torch.cuda.green_contexts.GreenContext(num_sms_split=num_sms_split)
+
+    def test_greencontext_num_sms_split_conflicts_with_num_sms(self):
+        with self.assertRaisesRegex(RuntimeError, "cannot be specified together"):
+            torch.cuda.green_contexts.GreenContext(num_sms=1, num_sms_split=((1,), 0))
+
     @unittest.skipIf(
         not PLATFORM_SUPPORTS_WORKQUEUE_CONFIG, "Workqueue config is not supported"
     )
@@ -12395,6 +12447,38 @@ class TestCudaGreenContexts(TestCase):
         self.assertIsNone(ctx_ref())
         self.assertEqual(destroyed_streams, list(reversed(streams)))
         self.assertEqual(destroyed_contexts, [])
+
+    def test_greencontext_sm_count_is_queried(self):
+        from torch.cuda import green_contexts
+
+        sm_count = [4]
+
+        class FakeDriver:
+            class CUdevResourceType:
+                CU_DEV_RESOURCE_TYPE_SM = 0
+
+            @staticmethod
+            def cuGreenCtxGetDevResource(*args):
+                class SmResource:
+                    smCount = sm_count[0]
+
+                class Resource:
+                    sm = SmResource()
+
+                return Resource()
+
+        ctx = object.__new__(green_contexts.GreenContext)
+        ctx._is_owning = False
+        ctx._init_from_cuda_objects(0, 1, 1, None, 0)
+        with (
+            patch.object(green_contexts, "_drv", FakeDriver),
+            patch.object(
+                green_contexts, "_check_cuda_bindings", new=lambda result: result
+            ),
+        ):
+            self.assertEqual(ctx.sm_count, 4)
+            sm_count[0] = 2
+            self.assertEqual(ctx.sm_count, 2)
 
     @serialTest()
     def test_greencontext_concurrent_stream_creation_uses_distinct_slots(self):
@@ -12546,8 +12630,8 @@ class TestCudaGreenContexts(TestCase):
         )
         expected_sms = sm_resource.sm.smCount // num_domains
 
-        resources, _ = green_contexts._get_localized_sm_resources(
-            device_id, locality_domain_backfill=True
+        resources, _ = green_contexts._get_disjoint_sm_resources(
+            device_id, use_locality_domains=True, locality_domain_backfill=True
         )
         self.assertEqual(len(resources), num_domains)
         self.assertTrue(
@@ -12594,7 +12678,9 @@ class TestCudaGreenContexts(TestCase):
             self.skipTest("Green context localization is not supported")
 
         device_id = torch.cuda.current_device()
-        localized_sms, remainder = green_contexts._get_localized_sm_resources(device_id)
+        localized_sms, remainder = green_contexts._get_disjoint_sm_resources(
+            device_id, use_locality_domains=True
+        )
         total_localized_sms = sum(resource.sm.smCount for resource in localized_sms)
         drv_device = green_contexts._check_cuda_bindings(
             green_contexts._drv.cuDeviceGet(device_id)
