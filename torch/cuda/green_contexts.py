@@ -188,7 +188,7 @@ def _get_localized_sm_resources(
     device_id: int,
     locality_domain_backfill: bool = False,
     coscheduled_sm_count: int = 0,
-) -> tuple[Any, ...]:
+) -> tuple[tuple[Any, ...], Any]:
     _ensure_localization_supported()
     num_domains = get_num_locality_domains(device_id)
     if num_domains <= 1:
@@ -232,7 +232,7 @@ def _get_localized_sm_resources(
     # Discovery mode may leave SMs outside the locality domains in the
     # remainder. Backfill requests equal groups whose total consumes the full
     # device SM resource, as enforced by the divisibility check above.
-    split_result, _remaining = _check_cuda_bindings(
+    split_result, remainder = _check_cuda_bindings(
         # pyrefly: ignore [missing-attribute]
         _drv.cuDevSmResourceSplit(
             num_domains,
@@ -241,7 +241,7 @@ def _get_localized_sm_resources(
             params,
         )
     )
-    return tuple(split_result)
+    return tuple(split_result), remainder
 
 
 def get_num_locality_domains(device: Device = None) -> int:
@@ -305,6 +305,7 @@ class GreenContext:
         workqueue_concurrency_limit: int | None = None,
         locality_domain_id: int | None = None,
         locality_domain_backfill: bool | None = None,
+        locality_domain_remainder: bool | None = None,
         coscheduled_sm_count: int | None = None,
         device_id: int | None = None,
         green_context_obj: Any | None = None,
@@ -312,10 +313,13 @@ class GreenContext:
         r"""Create a CUDA green context.
 
         At least one of ``num_sms``, ``workqueue_scope``,
-        ``locality_domain_id`` must be specified.
+        ``locality_domain_id``, or ``locality_domain_remainder`` must be
+        specified.
         ``num_sms`` and ``locality_domain_id`` cannot be specified together.
         ``locality_domain_backfill`` may only be specified together with
         ``locality_domain_id``.
+        ``locality_domain_remainder`` cannot be specified together with
+        ``locality_domain_id`` or ``locality_domain_backfill``.
         ``coscheduled_sm_count`` may only be specified together with
         ``locality_domain_id``.
 
@@ -342,6 +346,10 @@ class GreenContext:
                 locality domains receive an equal share of the device's SMs.
                 May only be specified with ``locality_domain_id``. Defaults to
                 ``None``.
+            locality_domain_remainder (bool, optional): If ``True``, use the
+                device SMs outside the locality domains. Cannot be specified
+                with ``locality_domain_id`` or ``locality_domain_backfill``.
+                Defaults to ``None``.
             coscheduled_sm_count (int, optional): The minimum number of SMs
                 guaranteed to be co-scheduled for a thread block cluster.
                 This determines the cluster capability of the green context
@@ -371,6 +379,7 @@ class GreenContext:
                 workqueue_concurrency_limit,
                 locality_domain_id,
                 locality_domain_backfill,
+                locality_domain_remainder,
                 coscheduled_sm_count,
                 device_id,
             ]
@@ -413,21 +422,35 @@ class GreenContext:
         scope_value = _parse_workqueue_scope(workqueue_scope)
         if scope_value is not None:
             _ensure_workqueue_supported()
-        if locality_domain_id is not None:
+        if locality_domain_id is not None or locality_domain_remainder:
             _ensure_localization_supported()
 
+        if locality_domain_remainder is not None and (
+            locality_domain_id is not None or locality_domain_backfill is not None
+        ):
+            raise RuntimeError(
+                "locality_domain_remainder cannot be specified with "
+                "locality_domain_id or locality_domain_backfill"
+            )
         if locality_domain_backfill is not None and locality_domain_id is None:
             raise RuntimeError("locality_domain_backfill requires locality_domain_id")
         if coscheduled_sm_count is not None and locality_domain_id is None:
             raise RuntimeError("coscheduled_sm_count requires locality_domain_id")
-        if num_sms is None and scope_value is None and locality_domain_id is None:
+        if (
+            num_sms is None
+            and scope_value is None
+            and locality_domain_id is None
+            and not locality_domain_remainder
+        ):
             raise RuntimeError(
                 "At least one of num_sms, workqueue_scope, or "
-                "locality_domain_id must be specified"
+                "locality_domain_id or locality_domain_remainder must be specified"
             )
-        if locality_domain_id is not None and num_sms is not None:
+        if (
+            locality_domain_id is not None or locality_domain_remainder
+        ) and num_sms is not None:
             raise RuntimeError(
-                "locality_domain_id and num_sms cannot be specified together"
+                "locality-domain SM resources and num_sms cannot be specified together"
             )
         if workqueue_concurrency_limit is not None and scope_value is None:
             raise RuntimeError(
@@ -480,17 +503,20 @@ class GreenContext:
                 raise RuntimeError("Failed to create single SM resource group")
             resources.append(split_result[0])
 
-        if locality_domain_id is not None:
-            localized_sms = _get_localized_sm_resources(
+        if locality_domain_id is not None or locality_domain_remainder:
+            localized_sms, remainder = _get_localized_sm_resources(
                 device_id, bool(locality_domain_backfill), coscheduled_sm_count
             )
             num_locality_domains = len(localized_sms)
-            if locality_domain_id < 0 or locality_domain_id >= num_locality_domains:
-                raise RuntimeError(
-                    "Invalid locality domain ID: "
-                    f"{locality_domain_id} (device has {num_locality_domains})"
-                )
-            resources.append(localized_sms[locality_domain_id])
+            if locality_domain_remainder:
+                resources.append(remainder)
+            elif locality_domain_id is not None:
+                if locality_domain_id < 0 or locality_domain_id >= num_locality_domains:
+                    raise RuntimeError(
+                        "Invalid locality domain ID: "
+                        f"{locality_domain_id} (device has {num_locality_domains})"
+                    )
+                resources.append(localized_sms[locality_domain_id])
 
         if scope_value is not None:
             wq_resource = _check_cuda_bindings(
@@ -604,6 +630,7 @@ class GreenContext:
         workqueue_concurrency_limit: int | None = None,
         locality_domain_id: int | None = None,
         locality_domain_backfill: bool | None = None,
+        locality_domain_remainder: bool | None = None,
         coscheduled_sm_count: int | None = None,
         device_id: int | None = None,
     ) -> GreenContext:
@@ -617,6 +644,7 @@ class GreenContext:
             workqueue_concurrency_limit=workqueue_concurrency_limit,
             locality_domain_id=locality_domain_id,
             locality_domain_backfill=locality_domain_backfill,
+            locality_domain_remainder=locality_domain_remainder,
             coscheduled_sm_count=coscheduled_sm_count,
             device_id=device_id,
         )

@@ -12176,6 +12176,19 @@ class TestCudaGreenContexts(TestCase):
     def tearDown(self):
         super().tearDown()
 
+    @parametrize(
+        "bindings_version",
+        ["13.4.0b1", "13.4.0rc2", "13.4.1.dev5+g1e994c73"],
+    )
+    def test_greencontext_cuda_bindings_prerelease_version(self, bindings_version):
+        from torch.cuda import green_contexts
+
+        with (
+            patch.object(green_contexts, "_get_driver_version", return_value=13040),
+            patch.object(green_contexts, "_cuda_bindings_version", bindings_version),
+        ):
+            green_contexts._ensure_driver_version(13040, "unsupported")
+
     def test_greencontext_set_pop_context_deprecation(self):
         # need to start on a side stream as we are comparing pointers and want to avoid
         # two NULL streams...
@@ -12533,7 +12546,7 @@ class TestCudaGreenContexts(TestCase):
         )
         expected_sms = sm_resource.sm.smCount // num_domains
 
-        resources = green_contexts._get_localized_sm_resources(
+        resources, _ = green_contexts._get_localized_sm_resources(
             device_id, locality_domain_backfill=True
         )
         self.assertEqual(len(resources), num_domains)
@@ -12572,6 +12585,43 @@ class TestCudaGreenContexts(TestCase):
                             locality_domain_backfill=locality_domain_backfill,
                             **other_args,
                         )
+
+    @serialTest()
+    def test_greencontext_locality_remainder(self):
+        from torch.cuda import green_contexts
+
+        if not green_contexts.is_localization_supported():
+            self.skipTest("Green context localization is not supported")
+
+        device_id = torch.cuda.current_device()
+        localized_sms, remainder = green_contexts._get_localized_sm_resources(device_id)
+        total_localized_sms = sum(resource.sm.smCount for resource in localized_sms)
+        drv_device = green_contexts._check_cuda_bindings(
+            green_contexts._drv.cuDeviceGet(device_id)
+        )
+        sm_resource = green_contexts._check_cuda_bindings(
+            green_contexts._drv.cuDeviceGetDevResource(
+                drv_device,
+                green_contexts._drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
+            )
+        )
+        self.assertEqual(
+            remainder.sm.smCount, sm_resource.sm.smCount - total_localized_sms
+        )
+
+        for other_arg in (
+            {"locality_domain_id": 0},
+            {"locality_domain_backfill": False},
+        ):
+            with self.subTest(other_arg=other_arg):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "locality_domain_remainder cannot be specified with",
+                ):
+                    green_contexts.GreenContext(
+                        locality_domain_remainder=True,
+                        **other_arg,
+                    )
 
     @serialTest()
     def test_greencontext_coscheduled_sm_count(self):
