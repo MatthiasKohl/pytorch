@@ -9,12 +9,11 @@ from typing import Any, TYPE_CHECKING
 from typing_extensions import deprecated
 
 import torch
-from torch._vendor.packaging.version import Version
 from torch.cuda._utils import (
     _check_cuda_bindings,
     _cuda_bindings_driver as _drv,
     _cuda_bindings_runtime as _rt,
-    _cuda_bindings_version,
+    _ensure_cuda_bindings_version,
     _get_device_index,
     _HAS_CUDA_BINDINGS,
 )
@@ -34,6 +33,8 @@ __all__ = [
 ]
 
 _STREAMS_PER_GREEN_CONTEXT_POOL = 32
+_NVML_DEVICE_MIG_ENABLE = 1
+_NVML_GPU_VIRTUALIZATION_MODE_VGPU = 2
 
 _WORKQUEUE_SCOPE_VALUES = {
     "device_ctx": 0,
@@ -64,22 +65,11 @@ def _get_driver_version() -> int:
         return -1
 
 
-def _ensure_driver_version(version: int, message: str) -> None:
+def _ensure_cuda_version(version: int, message: str) -> None:
     drv_version = _get_driver_version()
     if drv_version < 0 or drv_version < version:
         raise RuntimeError(message)
-    try:
-        # Prereleases compare as their target release, e.g. 13.4.0b1 as 13.4.0.
-        vs = Version(str(_cuda_bindings_version)).release
-        cb_version = vs[0] * 1000 + vs[1] * 10
-        if len(vs) > 2:
-            cb_version += vs[2]
-    except Exception:
-        raise RuntimeError(
-            f"Invalid cuda.bindings version: '{_cuda_bindings_version}'"
-        ) from None
-    if cb_version < 0 or cb_version < version:
-        raise RuntimeError(message)
+    _ensure_cuda_bindings_version(version, message)
 
 
 def _ensure_supported() -> None:
@@ -89,13 +79,13 @@ def _ensure_supported() -> None:
         raise RuntimeError("Green Context is not supported on Windows")
     if not _HAS_CUDA_BINDINGS:
         raise RuntimeError("GreenContext requires the cuda.bindings package")
-    _ensure_driver_version(
+    _ensure_cuda_version(
         12080, "Green Context requires user mode driver and cuda.bindings package 12.8+"
     )
 
 
 def _ensure_workqueue_supported() -> None:
-    _ensure_driver_version(
+    _ensure_cuda_version(
         13010,
         "Green Context workqueue configuration requires user mode driver and "
         "cuda.bindings package 13.1+",
@@ -103,7 +93,7 @@ def _ensure_workqueue_supported() -> None:
 
 
 def _ensure_localization_supported() -> None:
-    _ensure_driver_version(
+    _ensure_cuda_version(
         13040,
         "Green Context localization requires user mode driver and "
         "cuda.bindings package 13.4+",
@@ -129,6 +119,60 @@ def _get_drv_device(device_id: int) -> Any:
     return _check_cuda_bindings(_drv.cuDeviceGet(device_id))
 
 
+def _uses_single_locality_domain_nvml(device: Device) -> bool | None:
+    from ctypes import byref, c_int, c_uint, c_void_p, CDLL
+
+    try:
+        nvml_h = CDLL("libnvidia-ml.so.1")
+        if nvml_h.nvmlInit() != 0:
+            return None
+        device_index = torch.cuda._get_nvml_device_index(device)
+        device_handle = c_void_p()
+        if (
+            nvml_h.nvmlDeviceGetHandleByIndex_v2(
+                device_index, byref(device_handle)
+            )
+            != 0
+        ):
+            raise RuntimeError(f"NVML cannot get handle for device {device_index}")
+
+        virtualization_mode = c_int()
+        if (
+            nvml_h.nvmlDeviceGetVirtualizationMode(
+                device_handle, byref(virtualization_mode)
+            )
+            == 0
+            and virtualization_mode.value == _NVML_GPU_VIRTUALIZATION_MODE_VGPU
+        ):
+            return True
+
+        is_mig_device = c_uint()
+        if (
+            nvml_h.nvmlDeviceIsMigDeviceHandle(
+                device_handle, byref(is_mig_device)
+            )
+            == 0
+            and is_mig_device.value != 0
+        ):
+            return True
+
+        current_mig_mode = c_uint()
+        pending_mig_mode = c_uint()
+        if (
+            nvml_h.nvmlDeviceGetMigMode(
+                device_handle, byref(current_mig_mode), byref(pending_mig_mode)
+            )
+            == 0
+            and current_mig_mode.value == _NVML_DEVICE_MIG_ENABLE
+        ):
+            return True
+
+        numa_node = c_uint()
+        return nvml_h.nvmlDeviceGetNumaNodeId(device_handle, byref(numa_node)) == 0
+    except (AttributeError, IndexError, OSError):
+        return None
+
+
 @functools.cache
 def _get_num_locality_domains(device_id: int) -> int:
     _ensure_supported()
@@ -137,12 +181,53 @@ def _get_num_locality_domains(device_id: int) -> int:
     device_result = _drv.cuDeviceGet(device_id)
     # pyrefly: ignore [missing-attribute]
     if device_result[0] == _drv.CUresult.CUDA_ERROR_NOT_INITIALIZED:
-        # note: all devices with SM 10.X have exactly 2 locality domains, and
-        # any device with SM < 10.0 or SM == 12.X has 1 locality domain, so
-        # we can safely provide the result without initializing the CUDA context
-        # and poisoning the fork. In the future, this might need to be updated.
-        capability = torch.cuda._raw_device_capability_nvml(device_id)
-        return 2 if capability is not None and capability[0] == 10 else 1
+        # Without initializing the CUDA driver/context, we can only determine
+        # locality domain support under certain conditions:
+        # all NVML devices visible through `CUDA_VISIBLE_DEVICES` must agree;
+        # we assume that `device_id` must be one of these devices.
+        # Locality domains are not supported on Windows, but this is already
+        # checked in `_ensure_supported` above.
+        # We check for vGPU/MIG devices or devices exposed as NUMA nodes:
+        # these don't support locality domains either, so it must be 1.
+        # Finally, all devices with SM 10.X have exactly 2 locality domains,
+        # and devices with SM < 10.0 or SM == 12.X have 1 locality domain.
+        # These conditions might evolve in the future.
+
+        visible_devices = torch.cuda._parse_visible_devices()
+        # UUID parsing stops at the first identifier with a different prefix,
+        # so a returned string list beginning with MIG- contains only MIG UUIDs.
+        if (
+            visible_devices
+            and isinstance(visible_devices[0], str)
+            and visible_devices[0].startswith("MIG-")
+        ):
+            return 1
+        num_nvml_devices = torch.cuda._device_count_nvml()
+        if num_nvml_devices <= 0:
+            raise RuntimeError(
+                "Cannot determine the locality domain count before CUDA "
+                "initialization because NVML device count is not available"
+            )
+        loc_domains = []
+        for nvml_id in range(num_nvml_devices):
+            capability = torch.cuda._raw_device_capability_nvml(nvml_id)
+            single_domain = _uses_single_locality_domain_nvml(nvml_id)
+            if single_domain is None or capability is None:
+                raise RuntimeError(
+                    "Cannot determine the locality domain count before CUDA "
+                    "initialization because NVML device queries failed for "
+                    "some visible device(s)"
+                )
+            loc_domains.append(2 if not single_domain and capability[0] == 10 else 1)
+        unique_loc_domains = set(loc_domains)
+        if len(unique_loc_domains) != 1:
+            raise RuntimeError(
+                "Cannot determine the locality domain count before CUDA "
+                "initialization because visible NVML devices have different "
+                "inferred locality domain counts: "
+                f"{sorted(unique_loc_domains)}"
+            )
+        return loc_domains[0]
     device = _check_cuda_bindings(device_result)
     return _check_cuda_bindings(
         # pyrefly: ignore [missing-attribute]
@@ -260,15 +345,15 @@ def get_num_locality_domains(device: Device = None) -> int:
             device_id = 0
         else:
             device_id = _get_device_index(device)
-    return _get_num_locality_domains(device_id)
+    try:
+        return _get_num_locality_domains(device_id)
+    except RuntimeError:
+        return 1
 
 
 def is_localization_supported(device: Device = None) -> bool:
     r"""Return whether CUDA green context localization is available."""
-    try:
-        return get_num_locality_domains(device) > 1
-    except RuntimeError:
-        return False
+    return get_num_locality_domains(device) > 1
 
 
 class GreenContext:
@@ -385,7 +470,7 @@ class GreenContext:
                 raise RuntimeError("Green ctx conversion to regular ctx failed!")
             # pyrefly: ignore [missing-attribute]
             device_id = int(_check_cuda_bindings(_drv.cuCtxGetDevice_v2(context)))
-            num_locality_domains = _get_num_locality_domains(device_id)
+            num_locality_domains = get_num_locality_domains(device_id)
             sm_res = _check_cuda_bindings(
                 # pyrefly: ignore [missing-attribute]
                 _drv.cuGreenCtxGetDevResource(

@@ -3,6 +3,7 @@ import sys
 from typing import Any
 
 import torch
+from torch._vendor.packaging.version import Version
 
 
 try:
@@ -31,6 +32,21 @@ if _HAS_CUDA_BINDINGS and torch.version.hip is not None:
 
 # The _get_device_index has been moved to torch.utils._get_device_index
 from torch._utils import _get_device_index as _torch_get_device_index
+
+
+def _ensure_cuda_bindings_version(version: int, message: str) -> None:
+    try:
+        # Prereleases compare as their target release, e.g. 13.4.0b1 as 13.4.0.
+        release = Version(str(_cuda_bindings_version)).release
+        bindings_version = release[0] * 1000 + release[1] * 10
+        if len(release) > 2:
+            bindings_version += release[2]
+    except Exception:
+        raise RuntimeError(
+            f"Invalid cuda.bindings version: '{_cuda_bindings_version}'"
+        ) from None
+    if bindings_version < version:
+        raise RuntimeError(message)
 
 
 def _get_hip_runtime_library() -> ctypes.CDLL:

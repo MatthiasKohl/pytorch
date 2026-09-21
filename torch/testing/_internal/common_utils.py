@@ -2019,6 +2019,13 @@ requires_accelerator = lazy_skip_if(
 def skipIfCrossRef(fn):
     return lazy_skip_if(lambda: TEST_WITH_CROSSREF, "test doesn't currently with crossref")(fn)
 
+
+skipIfNoGreenContextLocalization = lazy_skip_if(
+    lambda: not torch.cuda.green_contexts.is_localization_supported(),
+    "Green context localization is not supported",
+)
+
+
 class CrossRefMode(torch.overrides.TorchFunctionMode):
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}

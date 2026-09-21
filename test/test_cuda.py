@@ -97,6 +97,7 @@ from torch.testing._internal.common_utils import (
     setBlasBackendsToDefaultFinally,
     skipCUDAMemoryLeakCheckIf,
     skipCUDANonDefaultStreamIf,
+    skipIfNoGreenContextLocalization,
     skipIfRocm,
     skipIfRocmArch,
     skipIfRocmVersionAtLeast,
@@ -12629,11 +12630,9 @@ class TestCudaGreenContexts(TestCase):
         self.assertEqual(torch.cuda.current_stream(), caller_stream)
 
     @serialTest()
+    @skipIfNoGreenContextLocalization
     def test_greencontext_locality_backfill(self):
         from torch.cuda import green_contexts
-
-        if not green_contexts.is_localization_supported():
-            self.skipTest("Green context localization is not supported")
 
         device_id = torch.cuda.current_device()
         num_domains = green_contexts.get_num_locality_domains(device_id)
@@ -12689,11 +12688,9 @@ class TestCudaGreenContexts(TestCase):
                         )
 
     @serialTest()
+    @skipIfNoGreenContextLocalization
     def test_greencontext_coscheduled_sm_count(self):
         from torch.cuda import green_contexts
-
-        if not green_contexts.is_localization_supported():
-            self.skipTest("Green context localization is not supported")
 
         device_id = torch.cuda.current_device()
         coscheduled_sm_count = 2
@@ -12711,11 +12708,9 @@ class TestCudaGreenContexts(TestCase):
         self.assertEqual(resource.sm.smCoscheduledAlignment, coscheduled_sm_count)
 
     @parametrize("coscheduled_sm_count", [-1, 1, 34])
+    @skipIfNoGreenContextLocalization
     def test_greencontext_invalid_coscheduled_sm_count(self, coscheduled_sm_count):
         from torch.cuda import green_contexts
-
-        if not green_contexts.is_localization_supported():
-            self.skipTest("Green context localization is not supported")
 
         device_id = torch.cuda.current_device()
         with self.assertRaisesRegex(
