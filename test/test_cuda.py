@@ -12392,7 +12392,7 @@ class TestCudaGreenContexts(TestCase):
         if sm_resource.sm.smCount <= 3 * group_size:
             self.skipTest("Device does not have enough SMs for two resource groups")
 
-        split = green_contexts.GCS(num_sms=[group_size, 2 * group_size])
+        split = green_contexts.GreenContextSplit(num_sms=[group_size, 2 * group_size])
         remainder_count = sm_resource.sm.smCount - sum(split.num_sms)
 
         selected = green_contexts.GreenContext.create(
@@ -12414,7 +12414,7 @@ class TestCudaGreenContexts(TestCase):
         self.assertEqual(remainder.sm_count, remainder_count)
 
         backfill_contexts, backfill_remainder = green_contexts.GreenContext.split(
-            green_contexts.GCS(num_sms=group_size, backfill=True),
+            green_contexts.GreenContextSplit(num_sms=group_size, backfill=True),
             device_id=device_id,
         )
         self.assertEqual(
@@ -12427,7 +12427,8 @@ class TestCudaGreenContexts(TestCase):
         )
 
         discovered = green_contexts.GreenContext(
-            disjoint_split=(green_contexts.GCS(), 0), device_id=device_id
+            disjoint_split=(green_contexts.GreenContextSplit(), 0),
+            device_id=device_id,
         )
         self.assertGreater(discovered.sm_count, 0)
 
@@ -12439,34 +12440,36 @@ class TestCudaGreenContexts(TestCase):
         "disjoint_split,error",
         [
             (
-                (torch.cuda.green_contexts.GCS(num_sms=()), 0),
+                (torch.cuda.green_contexts.GreenContextSplit(num_sms=()), 0),
                 "at least one group",
             ),
             (
-                (torch.cuda.green_contexts.GCS(num_sms=(1,)), -1),
+                (torch.cuda.green_contexts.GreenContextSplit(num_sms=(1,)), -1),
                 "group index",
             ),
             (
-                (torch.cuda.green_contexts.GCS(num_sms=(1,)), 2),
+                (torch.cuda.green_contexts.GreenContextSplit(num_sms=(1,)), 2),
                 "group index",
             ),
             (
-                (torch.cuda.green_contexts.GCS(num_sms=(1,)), True),
+                (torch.cuda.green_contexts.GreenContextSplit(num_sms=(1,)), True),
                 "group index must be an integer",
             ),
             (
-                (torch.cuda.green_contexts.GCS(num_sms=(True,)), 0),
+                (torch.cuda.green_contexts.GreenContextSplit(num_sms=(True,)), 0),
                 "Invalid number of SMs",
             ),
             (
                 (
-                    torch.cuda.green_contexts.GCS(num_sms=(2,), backfill=(False, True)),
+                    torch.cuda.green_contexts.GreenContextSplit(
+                        num_sms=(2,), backfill=(False, True)
+                    ),
                     0,
                 ),
                 "same length",
             ),
             (
-                (torch.cuda.green_contexts.GCS(backfill=1), 0),
+                (torch.cuda.green_contexts.GreenContextSplit(backfill=1), 0),
                 "backfill entries must be bool",
             ),
         ],
@@ -12479,13 +12482,16 @@ class TestCudaGreenContexts(TestCase):
         with self.assertRaisesRegex(RuntimeError, "cannot be specified together"):
             torch.cuda.green_contexts.GreenContext(
                 num_sms=1,
-                disjoint_split=(torch.cuda.green_contexts.GCS(num_sms=2), 0),
+                disjoint_split=(
+                    torch.cuda.green_contexts.GreenContextSplit(num_sms=2),
+                    0,
+                ),
             )
 
     def test_greencontext_disjoint_split_broadcasts_scalars(self):
         from torch.cuda import green_contexts
 
-        split = green_contexts.GCS(
+        split = green_contexts.GreenContextSplit(
             num_sms=[8, 6, 0],
             locality_domain_ids=None,
             backfill=[False, True, True],
@@ -12502,7 +12508,7 @@ class TestCudaGreenContexts(TestCase):
         )
         self.assertEqual(
             green_contexts._normalize_disjoint_split(
-                green_contexts.GCS(locality_domain_ids=0)
+                green_contexts.GreenContextSplit(locality_domain_ids=0)
             ),
             ((0,), (0,), (False,), (0,)),
         )
@@ -12788,7 +12794,7 @@ class TestCudaGreenContexts(TestCase):
         if sm_resource.sm.smCount % num_domains != 0:
             self.skipTest("Device SM count is not evenly divisible by locality domains")
         expected_sms = sm_resource.sm.smCount // num_domains
-        split = green_contexts.GCS(
+        split = green_contexts.GreenContextSplit(
             num_sms=expected_sms,
             locality_domain_ids=tuple(range(num_domains)),
             backfill=True,
@@ -12820,7 +12826,9 @@ class TestCudaGreenContexts(TestCase):
 
         device_id = torch.cuda.current_device()
         num_domains = green_contexts.get_num_locality_domains(device_id)
-        split = green_contexts.GCS(locality_domain_ids=tuple(range(num_domains)))
+        split = green_contexts.GreenContextSplit(
+            locality_domain_ids=tuple(range(num_domains))
+        )
         resources, _remainder = green_contexts._get_disjoint_sm_resources(
             device_id, split
         )
@@ -12852,7 +12860,7 @@ class TestCudaGreenContexts(TestCase):
             self.skipTest("Device does not have enough SMs for the requested groups")
 
         contexts, remainder = green_contexts.GreenContext.split(
-            green_contexts.GCS(
+            green_contexts.GreenContextSplit(
                 num_sms=group_size,
                 locality_domain_ids=locality_domain_ids,
             ),
@@ -12899,7 +12907,7 @@ class TestCudaGreenContexts(TestCase):
         coscheduled_sm_count = 2
         context = green_contexts.GreenContext.create(
             disjoint_split=(
-                green_contexts.GCS(
+                green_contexts.GreenContextSplit(
                     locality_domain_ids=0,
                     coscheduled_sm_count=coscheduled_sm_count,
                 ),
@@ -12930,7 +12938,7 @@ class TestCudaGreenContexts(TestCase):
         ):
             green_contexts.GreenContext(
                 disjoint_split=(
-                    green_contexts.GCS(
+                    green_contexts.GreenContextSplit(
                         coscheduled_sm_count=coscheduled_sm_count,
                     ),
                     0,
@@ -12950,7 +12958,7 @@ class TestCudaGreenContexts(TestCase):
         if torch.cuda.get_device_capability(device_id)[0] < 9:
             self.skipTest("Test requires support for coscheduled_sm_count=4")
 
-        split = green_contexts.GCS(
+        split = green_contexts.GreenContextSplit(
             num_sms=6,
             backfill=True,
             coscheduled_sm_count=4,

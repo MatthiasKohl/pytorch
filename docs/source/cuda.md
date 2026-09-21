@@ -450,6 +450,7 @@ deprecated compatibility APIs.
     :nosignatures:
 
     GreenContext
+    GreenContextSplit
     execute_in_green_contexts
     get_green_context_from_stream
     get_num_locality_domains

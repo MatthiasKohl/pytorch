@@ -26,8 +26,8 @@ if TYPE_CHECKING:
     from torch.types import Device
 
 __all__ = [
-    "GCS",
     "GreenContext",
+    "GreenContextSplit",
     "execute_in_green_contexts",
     "get_green_context_from_stream",
     "get_num_locality_domains",
@@ -55,7 +55,7 @@ _STREAM_TO_GREEN_CTX: weakref.WeakValueDictionary[int, GreenContext] = (
 _STREAM_TO_GREEN_CTX_LOCK = threading.RLock()
 
 
-class GCS(NamedTuple):
+class GreenContextSplit(NamedTuple):
     r"""Describe the SM groups in a disjoint Green Context split.
 
     Each field may be a sequence with one entry per group or a scalar, which is
@@ -368,15 +368,15 @@ def _split_sm_resources(
 
 
 def _normalize_disjoint_split(
-    sm_split: GCS,
+    sm_split: GreenContextSplit,
 ) -> tuple[
     tuple[int, ...],
     tuple[int | None, ...],
     tuple[bool, ...],
     tuple[int, ...],
 ]:
-    if not isinstance(sm_split, GCS):
-        raise RuntimeError("disjoint_split must contain a GCS")
+    if not isinstance(sm_split, GreenContextSplit):
+        raise RuntimeError("disjoint_split must contain a GreenContextSplit")
 
     fields = (
         ("num_sms", sm_split.num_sms),
@@ -393,11 +393,13 @@ def _normalize_disjoint_split(
     if not lengths:
         num_groups = 1
     elif len(lengths) != 1:
-        raise RuntimeError("All sequence fields in GCS must have the same length")
+        raise RuntimeError(
+            "All sequence fields in GreenContextSplit must have the same length"
+        )
     else:
         num_groups = lengths.pop()
     if num_groups == 0:
-        raise RuntimeError("GCS must contain at least one group")
+        raise RuntimeError("GreenContextSplit must contain at least one group")
 
     def broadcast(name: str, value: Any) -> tuple[Any, ...]:
         if name in sequences:
@@ -414,7 +416,7 @@ def _normalize_disjoint_split(
 
 def _get_disjoint_sm_resources(
     device_id: int,
-    sm_split: GCS,
+    sm_split: GreenContextSplit,
 ) -> tuple[tuple[Any, ...], Any]:
     return _get_disjoint_sm_resources_cached(
         device_id, *_normalize_disjoint_split(sm_split)
@@ -431,7 +433,7 @@ def _get_disjoint_sm_resources_cached(
 ) -> tuple[tuple[Any, ...], Any]:
     _ensure_disjoint_sm_split_supported()
     if any(not isinstance(value, bool) for value in backfill):
-        raise RuntimeError("GCS backfill entries must be bool values")
+        raise RuntimeError("GreenContextSplit backfill entries must be bool values")
     for coscheduled_sm_count in coscheduled_sm_counts:
         _validate_coscheduled_sm_count(device_id, coscheduled_sm_count)
     if any(domain_id is not None for domain_id in locality_domain_ids):
@@ -464,7 +466,7 @@ def _get_disjoint_sm_resources_cached(
             )
         ):
             raise RuntimeError(
-                "Invalid number of SMs requested in GCS: each count must be 0 "
+                "Invalid number of SMs requested in GreenContextSplit: each count must be 0 "
                 "for discovery or an even value at least as large as its "
                 "effective coscheduled SM count; without backfill it must also "
                 f"be a multiple of that count, got {sm_count}"
@@ -472,7 +474,7 @@ def _get_disjoint_sm_resources_cached(
     requested_sm_count = sum(sm_counts)
     if requested_sm_count > sm_resource.sm.smCount:
         raise RuntimeError(
-            "Invalid total number of SMs requested in GCS: "
+            "Invalid total number of SMs requested in GreenContextSplit: "
             f"{requested_sm_count} (device has {sm_resource.sm.smCount} SMs)"
         )
 
@@ -491,7 +493,7 @@ def _get_disjoint_sm_resources_cached(
                 or domain_id >= num_domains
             ):
                 raise RuntimeError(
-                    "Invalid locality domain ID in GCS: "
+                    "Invalid locality domain ID in GreenContextSplit: "
                     f"{domain_id} (device has {num_domains})"
                 )
 
@@ -563,7 +565,7 @@ class GreenContext:
         num_sms: int | None = None,
         workqueue_scope: str | None = None,
         workqueue_concurrency_limit: int | None = None,
-        disjoint_split: tuple[GCS, int] | None = None,
+        disjoint_split: tuple[GreenContextSplit, int] | None = None,
         device_id: int | None = None,
         green_context_obj: Any | None = None,
     ) -> None:
@@ -588,7 +590,8 @@ class GreenContext:
             workqueue_concurrency_limit (int, optional): Maximum number of
                 concurrent stream-ordered workloads for the workqueue. Requires
                 ``workqueue_scope`` to be set.
-            disjoint_split (tuple[GCS, int], optional): A disjoint SM split and
+            disjoint_split (tuple[GreenContextSplit, int], optional): A disjoint
+                SM split and
                 the index of the group to use. An index equal to the number of
                 requested groups selects the remainder.
             device_id (int, optional): The device index used.
@@ -832,7 +835,7 @@ class GreenContext:
 
     @staticmethod
     def split(
-        sm_split: GCS,
+        sm_split: GreenContextSplit,
         device_id: int | None = None,
     ) -> tuple[tuple[GreenContext, ...], GreenContext | None]:
         r"""Create green contexts for every group in a disjoint SM split.
@@ -841,7 +844,7 @@ class GreenContext:
         ``sm_split.num_sms``, plus the remainder context if it is not empty.
 
         Arguments:
-            sm_split (GCS): The requested disjoint SM groups.
+            sm_split (GreenContextSplit): The requested disjoint SM groups.
             device_id (int, optional): The device index used. When ``None``,
                 the current device is used.
         """
@@ -866,7 +869,7 @@ class GreenContext:
         num_sms: int | None = None,
         workqueue_scope: str | None = None,
         workqueue_concurrency_limit: int | None = None,
-        disjoint_split: tuple[GCS, int] | None = None,
+        disjoint_split: tuple[GreenContextSplit, int] | None = None,
         device_id: int | None = None,
     ) -> GreenContext:
         r"""Create a CUDA green context.
