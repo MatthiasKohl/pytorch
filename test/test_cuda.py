@@ -12507,55 +12507,6 @@ class TestCudaGreenContexts(TestCase):
             ((0,), (0,), (False,), (0,)),
         )
 
-    def test_greencontext_split_locality_flags_are_per_group(self):
-        from torch.cuda import green_contexts
-
-        params = []
-
-        class FakeGroupFlags:
-            CU_DEV_SM_RESOURCE_GROUP_DEFAULT = 0
-            CU_DEV_SM_RESOURCE_GROUP_BACKFILL = 1
-            CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_ID = 2
-
-        class FakeParams:
-            pass
-
-        class FakeDriver:
-            CUdevSmResourceGroup_flags = FakeGroupFlags
-            CU_DEV_SM_RESOURCE_GROUP_PARAMS = FakeParams
-
-            @staticmethod
-            def cuDevSmResourceSplit(*args):
-                params.extend(args[-1])
-                return (object(), object(), object()), object()
-
-        with (
-            patch.object(green_contexts, "_drv", FakeDriver),
-            patch.object(
-                green_contexts, "_check_cuda_bindings", new=lambda result: result
-            ),
-        ):
-            green_contexts._split_sm_resources(
-                object(),
-                (4, 2, 3),
-                (0, None, 1),
-                (False, True, False),
-                (2, 4, 6),
-            )
-
-        self.assertEqual(
-            tuple(param.flags for param in params),
-            (
-                FakeGroupFlags.CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_ID,
-                FakeGroupFlags.CU_DEV_SM_RESOURCE_GROUP_BACKFILL,
-                FakeGroupFlags.CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_ID,
-            ),
-        )
-        self.assertEqual(params[0].localityDomainId, 0)
-        self.assertFalse(hasattr(params[1], "localityDomainId"))
-        self.assertEqual(params[2].localityDomainId, 1)
-        self.assertEqual(tuple(param.coscheduledSmCount for param in params), (2, 4, 6))
-
     @unittest.skipIf(
         not PLATFORM_SUPPORTS_WORKQUEUE_CONFIG, "Workqueue config is not supported"
     )
@@ -12687,38 +12638,6 @@ class TestCudaGreenContexts(TestCase):
         self.assertIsNone(ctx_ref())
         self.assertEqual(destroyed_streams, list(reversed(streams)))
         self.assertEqual(destroyed_contexts, [])
-
-    def test_greencontext_sm_count_is_cached(self):
-        from torch.cuda import green_contexts
-
-        sm_count = [4]
-
-        class FakeDriver:
-            class CUdevResourceType:
-                CU_DEV_RESOURCE_TYPE_SM = 0
-
-            @staticmethod
-            def cuGreenCtxGetDevResource(*args):
-                class SmResource:
-                    smCount = sm_count[0]
-
-                class Resource:
-                    sm = SmResource()
-
-                return Resource()
-
-        ctx = object.__new__(green_contexts.GreenContext)
-        ctx._is_owning = False
-        ctx._init_from_cuda_objects(0, 1, 1, None, 0)
-        with (
-            patch.object(green_contexts, "_drv", FakeDriver),
-            patch.object(
-                green_contexts, "_check_cuda_bindings", new=lambda result: result
-            ),
-        ):
-            self.assertEqual(ctx.sm_count, 4)
-            sm_count[0] = 2
-            self.assertEqual(ctx.sm_count, 4)
 
     @serialTest()
     def test_greencontext_concurrent_stream_creation_uses_distinct_slots(self):
@@ -12907,6 +12826,69 @@ class TestCudaGreenContexts(TestCase):
         )
         self.assertEqual(len(resources), num_domains)
         self.assertTrue(all(resource.sm.smCount > 0 for resource in resources))
+
+    @serialTest()
+    @skipIfNoGreenContextLocalization
+    def test_greencontext_mixed_locality_domains(self):
+        from torch.cuda import green_contexts
+
+        device_id = torch.cuda.current_device()
+        num_domains = green_contexts.get_num_locality_domains(device_id)
+        drv_device = green_contexts._check_cuda_bindings(
+            green_contexts._drv.cuDeviceGet(device_id)
+        )
+        sm_resource = green_contexts._check_cuda_bindings(
+            green_contexts._drv.cuDeviceGetDevResource(
+                drv_device,
+                green_contexts._drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
+            )
+        )
+        group_size = max(
+            sm_resource.sm.minSmPartitionSize,
+            sm_resource.sm.smCoscheduledAlignment,
+        )
+        locality_domain_ids = (0, num_domains - 1, None)
+        if sm_resource.sm.smCount <= len(locality_domain_ids) * group_size:
+            self.skipTest("Device does not have enough SMs for the requested groups")
+
+        contexts, remainder = green_contexts.GreenContext.split(
+            green_contexts.GCS(
+                num_sms=group_size,
+                locality_domain_ids=locality_domain_ids,
+            ),
+            device_id=device_id,
+        )
+        resources = tuple(
+            green_contexts._check_cuda_bindings(
+                green_contexts._drv.cuGreenCtxGetDevResource(
+                    context._green_ctx,
+                    green_contexts._drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
+                )
+            )
+            for context in contexts
+        )
+        locality_flag = green_contexts._drv.CUdevSmResourceGroup_flags.CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_ID
+        self.assertEqual(
+            tuple(resource.sm.smCount for resource in resources), (group_size,) * 3
+        )
+        self.assertEqual(
+            tuple(
+                resource.sm.localityDomainId
+                if resource.sm.flags & locality_flag
+                else None
+                for resource in resources
+            ),
+            locality_domain_ids,
+        )
+        self.assertEqual(
+            tuple(context.locality_domain_id for context in contexts),
+            locality_domain_ids,
+        )
+        self.assertIsNotNone(remainder)
+        self.assertEqual(
+            remainder.sm_count,
+            sm_resource.sm.smCount - len(locality_domain_ids) * group_size,
+        )
 
     @serialTest()
     @skipIfNoGreenContextLocalization
