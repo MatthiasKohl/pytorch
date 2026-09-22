@@ -18,6 +18,7 @@ import unittest
 import warnings
 import weakref
 from collections import defaultdict
+from collections.abc import Sequence
 from copy import deepcopy
 from itertools import product
 from random import randint
@@ -47,6 +48,7 @@ from torch.testing._internal.common_cuda import (
     ROCM_VERSION,
     SM70OrLater,
     SM89OrLater,
+    SM90OrLater,
     TEST_CUDNN,
     TEST_MULTIGPU,
     tf32_enabled,
@@ -97,6 +99,8 @@ from torch.testing._internal.common_utils import (
     setBlasBackendsToDefaultFinally,
     skipCUDAMemoryLeakCheckIf,
     skipCUDANonDefaultStreamIf,
+    skipIfCudaMPS,
+    skipIfCudaSMCountLessThan,
     skipIfNoGreenContextLocalization,
     skipIfRocm,
     skipIfRocmArch,
@@ -12367,151 +12371,389 @@ class TestCudaGreenContexts(TestCase):
         full_res = torch.matmul(a, a)
         self.assertEqual(partial_res, full_res)
 
-    @unittest.skipIf(
-        not PLATFORM_SUPPORTS_WORKQUEUE_CONFIG,
-        "Disjoint SM splits are not supported",
-    )
-    @serialTest()
-    def test_greencontext_disjoint_split(self):
-        from torch.cuda import green_contexts
+    def _check_disjoint_sm_ids(
+        self,
+        contexts: Sequence[torch.cuda.green_contexts.GreenContext],
+        device: str,
+    ) -> None:
+        # MPS virtualizes SM IDs, making sets from different contexts incomparable.
+        # Callers use skipIfCudaMPS before creating any green contexts.
+        with torch.cuda.device(device):
+            kernel = torch.cuda._compile_kernel(
+                r"""
+                __global__ void record_sm_ids(int* ids) {
+                    if (threadIdx.x == 0) {
+                        unsigned int smid;
+                        asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+                        ids[blockIdx.x] = smid;
+                    }
+                    unsigned long long start = clock64();
+                    while (clock64() - start < 10000) {}
+                }
+                """,
+                "record_sm_ids",
+            )
+            # Use a device-scaled workload to exercise every allocated SM.
+            blocks = torch.cuda.get_device_properties(device).multi_processor_count * 64
+            seen: set[int] = set()
+            for context in contexts:
+                stream = context.Stream()
+                with torch.cuda.stream(stream):
+                    ids = torch.full((blocks,), -1, dtype=torch.int32, device=device)
+                    kernel(
+                        grid=(blocks, 1, 1),
+                        block=(512, 1, 1),
+                        shared_mem=16 * 1024,
+                        args=[ids],
+                    )
+                stream.synchronize()
+                used = set(ids.tolist())
+                self.assertNotIn(-1, used)
+                self.assertEqual(len(used), context.sm_count, "Incomplete SM coverage")
+                overlap = seen & used
+                self.assertFalse(overlap, f"Overlapping SM IDs: {overlap}")
+                seen.update(used)
 
-        device_id = torch.cuda.current_device()
-        drv_device = green_contexts._check_cuda_bindings(
-            green_contexts._drv.cuDeviceGet(device_id)
+    def test_greencontext_sm_count(self, device):
+        from torch.cuda._utils import _check_cuda_bindings, _cuda_bindings_driver as drv
+        from torch.cuda.green_contexts import GreenContext, SMPartition
+
+        device_id = torch.device(device).index
+        source = SMPartition.from_device(device_id)
+        self.assertEqual(
+            source.sm_count,
+            torch.cuda.get_device_properties(device).multi_processor_count,
         )
-        sm_resource = green_contexts._check_cuda_bindings(
-            green_contexts._drv.cuDeviceGetDevResource(
-                drv_device,
-                green_contexts._drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
+        context = GreenContext(num_sms=4, device_id=device_id)
+        actual = _check_cuda_bindings(
+            drv.cuGreenCtxGetDevResource(
+                context._green_ctx, drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
             )
         )
-        group_size = max(
-            sm_resource.sm.minSmPartitionSize,
-            sm_resource.sm.smCoscheduledAlignment,
-        )
-        if sm_resource.sm.smCount <= 3 * group_size:
-            self.skipTest("Device does not have enough SMs for two resource groups")
+        self.assertEqual(context.sm_count, actual.sm.smCount)
+        self.assertEqual(context.sm_partition.device_id, device_id)
+        self.assertEqual(context.sm_count, context.sm_partition.sm_count)
 
-        split = green_contexts.GreenContextSplit(num_sms=[group_size, 2 * group_size])
-        remainder_count = sm_resource.sm.smCount - sum(split.num_sms)
-
-        selected = green_contexts.GreenContext.create(
-            disjoint_split=(split, 1), device_id=device_id
+    def test_greencontext_resource_without_context(self, device):
+        code = """
+import sys
+import torch
+from torch.cuda.green_contexts import SMPartition
+from torch.cuda._utils import _check_cuda_bindings, _cuda_bindings_driver as drv
+resource = SMPartition.from_device(int(sys.argv[1]))
+print(resource.sm_count, torch.cuda.is_initialized(), int(_check_cuda_bindings(drv.cuCtxGetCurrent())))
+"""
+        output = subprocess.check_output(
+            [sys.executable, "-c", code, str(torch.device(device).index)], text=True
         )
-        self.assertEqual(selected.sm_count, 2 * group_size)
-        selected_remainder = green_contexts.GreenContext.create(
-            disjoint_split=(split, 2), device_id=device_id
-        )
-        self.assertEqual(selected_remainder.sm_count, remainder_count)
+        count = torch.cuda.get_device_properties(device).multi_processor_count
+        self.assertEqual(output.strip(), f"{count} False 0")
 
-        contexts, remainder = green_contexts.GreenContext.split(
-            split, device_id=device_id
+    @parametrize("nvml_failure", ["unavailable", "error"])
+    @skipIfNoGreenContextLocalization
+    def test_greencontext_locality_nvml_driver_fallback(self, device, nvml_failure):
+        code = """
+import json
+import sys
+import warnings
+from unittest.mock import patch
+import torch
+from torch.cuda.green_contexts import get_num_locality_domains
+from torch.cuda._utils import _check_cuda_bindings, _cuda_bindings_driver as drv
+
+error = RuntimeError("NVML unavailable") if sys.argv[2] == "error" else None
+with patch("torch.cuda._device_count_nvml", return_value=-1, side_effect=error):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        count = get_num_locality_domains(int(sys.argv[1]))
+print(json.dumps({
+    "count": count,
+    "torch_initialized": torch.cuda.is_initialized(),
+    "context": int(_check_cuda_bindings(drv.cuCtxGetCurrent())),
+    "warned": any("Falling back to CUDA driver initialization" in str(w.message) for w in caught),
+}))
+"""
+        output = subprocess.check_output(
+            [sys.executable, "-c", code, str(torch.device(device).index), nvml_failure],
+            text=True,
         )
         self.assertEqual(
-            tuple(context.sm_count for context in contexts), tuple(split.num_sms)
-        )
-        self.assertIsNotNone(remainder)
-        self.assertEqual(remainder.sm_count, remainder_count)
-
-        backfill_contexts, backfill_remainder = green_contexts.GreenContext.split(
-            green_contexts.GreenContextSplit(num_sms=group_size, backfill=True),
-            device_id=device_id,
-        )
-        self.assertEqual(
-            tuple(context.sm_count for context in backfill_contexts),
-            (group_size,),
-        )
-        self.assertIsNotNone(backfill_remainder)
-        self.assertEqual(
-            backfill_remainder.sm_count, sm_resource.sm.smCount - group_size
+            json.loads(output),
+            {
+                "count": torch.cuda.green_contexts.get_num_locality_domains(device),
+                "torch_initialized": False,
+                "context": 0,
+                "warned": True,
+            },
         )
 
-        discovered = green_contexts.GreenContext(
-            disjoint_split=(green_contexts.GreenContextSplit(), 0),
-            device_id=device_id,
+    def test_greencontext_partition_lifetime(self, device):
+        from torch.cuda.green_contexts import GreenContext
+
+        context = GreenContext(num_sms=4, device_id=torch.device(device).index)
+        partition = context.sm_partition
+        owner = weakref.ref(context)
+        del context
+        gc.collect()
+        self.assertIsNotNone(owner())
+        child = GreenContext(sm_partition=partition)
+        del partition
+        gc.collect()
+        self.assertIsNone(owner())
+        self.assertGreater(child.sm_count, 0)
+        stream = child.Stream()
+        with torch.cuda.stream(stream):
+            result = torch.arange(32, device=device) + 1
+        stream.synchronize()
+        self.assertEqual(result, torch.arange(32, device=device) + 1)
+
+    @serialTest()
+    @unittest.skipIf(
+        not PLATFORM_SUPPORTS_WORKQUEUE_CONFIG, "Disjoint SM splits are not supported"
+    )
+    @skipIfCudaMPS
+    @skipCUDAIf(not SM90OrLater, "Co-scheduled groups larger than 2 require SM90+")
+    @skipIfCudaSMCountLessThan(13)
+    def test_greencontext_recursive_sm_partitions(self, device):
+        from torch.cuda.green_contexts import GreenContext, SMPartition
+
+        source = SMPartition.from_device(torch.device(device).index)
+        (first,), rest = source.split(num_sms=4, coscheduled_sm_count=2)
+        rest_ctx = GreenContext(sm_partition=rest)
+        (second,), rest = rest_ctx.sm_partition.split(num_sms=8, coscheduled_sm_count=4)
+        self.assertEqual((first.sm_count, second.sm_count), (4, 8))
+        self.assertEqual(rest.sm_count, source.sm_count - 12)
+        self.assertEqual(first.coscheduled_sm_count, 2)
+        self.assertEqual(second.coscheduled_sm_count, 4)
+        first_ctx = GreenContext(sm_partition=first)
+        (a, b), empty = first_ctx.sm_partition.split(
+            num_sms=(2, 2), coscheduled_sm_count=2
         )
-        self.assertGreater(discovered.sm_count, 0)
+        self.assertIsNone(empty)
+        parent = GreenContext(sm_partition=second)
+        (c, d), empty = parent.sm_partition.split(
+            num_sms=(4, 4), coscheduled_sm_count=2
+        )
+        self.assertIsNone(empty)
+        self.assertEqual([p.sm_count for p in (a, b, c, d)], [2, 2, 4, 4])
+        contexts = [GreenContext(sm_partition=p) for p in (a, b, c, d)]
+        self.assertEqual([context.sm_count for context in contexts], [2, 2, 4, 4])
+        self._check_disjoint_sm_ids(contexts, device)
+
+    @parametrize("workqueue_scope", [None, "balanced", "device_ctx"])
+    @serialTest()
+    @unittest.skipIf(
+        not PLATFORM_SUPPORTS_WORKQUEUE_CONFIG, "Disjoint SM splits are not supported"
+    )
+    @skipIfCudaMPS
+    @skipIfCudaSMCountLessThan(24)
+    def test_greencontext_split(self, device, workqueue_scope):
+        from torch.cuda._utils import _check_cuda_bindings, _cuda_bindings_driver as drv
+        from torch.cuda.green_contexts import GreenContext
+
+        co_count = 8 if torch.cuda.get_device_capability(device)[0] >= 9 else 2
+        contexts = GreenContext.split(
+            num_sms=(8, 16),
+            coscheduled_sm_count=(2, co_count),
+            preferred_coscheduled_sm_count=co_count,
+            workqueue_scope=workqueue_scope,
+            workqueue_concurrency_limit=1 if workqueue_scope else None,
+            device_id=torch.device(device).index,
+        )
+        self.assertEqual([context.sm_count for context in contexts], [8, 16])
+        for context, minimum in zip(contexts, (2, co_count)):
+            self.assertGreaterEqual(context.sm_partition.coscheduled_sm_count, minimum)
+            stream = context.Stream()
+            with torch.cuda.stream(stream):
+                result = torch.arange(32, device=device) + 1
+            stream.synchronize()
+            self.assertEqual(result, torch.arange(32, device=device) + 1)
+        if workqueue_scope:
+            for context in contexts:
+                resource = _check_cuda_bindings(
+                    drv.cuGreenCtxGetDevResource(
+                        context._green_ctx,
+                        drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG,
+                    )
+                )
+                self.assertEqual(resource.wqConfig.wqConcurrencyLimit, 1)
+
+        self._check_disjoint_sm_ids(contexts, device)
 
     @unittest.skipIf(
-        not PLATFORM_SUPPORTS_WORKQUEUE_CONFIG,
-        "Disjoint SM splits are not supported",
+        not PLATFORM_SUPPORTS_WORKQUEUE_CONFIG, "Disjoint SM splits are not supported"
     )
+    def test_greencontext_split_discovery(self, device):
+        from torch.cuda.green_contexts import SMPartition
+
+        source = SMPartition.from_device(torch.device(device).index)
+        (first, rest), empty = source.split(num_sms=(4, 0), coscheduled_sm_count=2)
+        self.assertEqual(first.sm_count, 4)
+        self.assertEqual(rest.sm_count, source.sm_count - 4)
+        self.assertIsNone(empty)
+
+    @skipIfNoGreenContextLocalization
+    def test_greencontext_dynamic_split(self, device):
+        from torch.cuda.green_contexts import SMPartition
+
+        source = SMPartition.from_device(torch.device(device).index)
+        (first,), rest = source.split(num_sms=2)
+        self.assertEqual(first.sm_count, 2)
+        self.assertEqual(first.coscheduled_sm_count, 0)
+        self.assertEqual(rest.sm_count, source.sm_count - 2)
+        (whole,), empty = source.split()
+        self.assertEqual(whole.sm_count, source.sm_count)
+        self.assertIsNone(empty)
+
+    @unittest.skipIf(
+        not PLATFORM_SUPPORTS_WORKQUEUE_CONFIG, "Disjoint SM splits are not supported"
+    )
+    @skipCUDAIf(not SM90OrLater, "Co-scheduled groups larger than 2 require SM90+")
+    @skipIfCudaSMCountLessThan(11)
+    def test_greencontext_split_backfill(self, device):
+        from torch.cuda.green_contexts import SMPartition
+
+        source = SMPartition.from_device(torch.device(device).index)
+        with self.assertRaises(RuntimeError):
+            source.split(num_sms=10, coscheduled_sm_count=8)
+        (partition,), rest = source.split(
+            num_sms=10, coscheduled_sm_count=8, backfill=True
+        )
+        self.assertEqual(partition.sm_count, 10)
+        self.assertEqual(rest.sm_count, source.sm_count - 10)
+
     @parametrize(
-        "disjoint_split,error",
+        "kwargs,message",
         [
-            (
-                (torch.cuda.green_contexts.GreenContextSplit(num_sms=()), 0),
-                "at least one group",
-            ),
-            (
-                (torch.cuda.green_contexts.GreenContextSplit(num_sms=(1,)), -1),
-                "group index",
-            ),
-            (
-                (torch.cuda.green_contexts.GreenContextSplit(num_sms=(1,)), 2),
-                "group index",
-            ),
-            (
-                (torch.cuda.green_contexts.GreenContextSplit(num_sms=(1,)), True),
-                "group index must be an integer",
-            ),
-            (
-                (torch.cuda.green_contexts.GreenContextSplit(num_sms=(True,)), 0),
-                "Invalid number of SMs",
-            ),
-            (
-                (
-                    torch.cuda.green_contexts.GreenContextSplit(
-                        num_sms=(2,), backfill=(False, True)
-                    ),
-                    0,
-                ),
-                "same length",
-            ),
-            (
-                (torch.cuda.green_contexts.GreenContextSplit(backfill=1), 0),
-                "backfill entries must be bool",
-            ),
+            ({"num_sms": ()}, "at least one"),
+            ({"num_sms": -1}, "nonnegative integers"),
+            ({"num_sms": (4, 4), "coscheduled_sm_count": (2,)}, "same length"),
+            ({"num_sms": True}, "nonnegative integers"),
+            ({"num_sms": 4.0}, "nonnegative integers"),
+            ({"num_sms": 4, "backfill": 1}, "bool"),
+            ({"coscheduled_sm_count": False}, "nonnegative integers"),
+            ({"preferred_coscheduled_sm_count": -1}, "nonnegative integers"),
+            ({"locality_domain_ids": (None, None), "backfill": (True,)}, "same length"),
         ],
     )
-    def test_greencontext_invalid_disjoint_split(self, disjoint_split, error):
-        with self.assertRaisesRegex(RuntimeError, error):
-            torch.cuda.green_contexts.GreenContext(disjoint_split=disjoint_split)
+    @unittest.skipIf(
+        not PLATFORM_SUPPORTS_WORKQUEUE_CONFIG, "Disjoint SM splits are not supported"
+    )
+    def test_greencontext_split_invalid_arguments(self, device, kwargs, message):
+        from torch.cuda.green_contexts import SMPartition
 
-    def test_greencontext_disjoint_split_conflicts_with_num_sms(self):
-        with self.assertRaisesRegex(RuntimeError, "cannot be specified together"):
-            torch.cuda.green_contexts.GreenContext(
-                num_sms=1,
-                disjoint_split=(
-                    torch.cuda.green_contexts.GreenContextSplit(num_sms=2),
-                    0,
-                ),
+        source = SMPartition.from_device(torch.device(device).index)
+        with self.assertRaisesRegex(ValueError, message):
+            source.split(**kwargs)
+
+    @serialTest()
+    @skipIfNoGreenContextLocalization
+    @skipIfCudaMPS
+    def test_greencontext_locality_split(self, device):
+        from torch.cuda._utils import _check_cuda_bindings, _cuda_bindings_driver as drv
+        from torch.cuda.green_contexts import GreenContext
+
+        count = torch.cuda.green_contexts.get_num_locality_domains(device)
+        device_id = torch.device(device).index
+        sms_per_domain = _check_cuda_bindings(
+            drv.cuDeviceGetAttribute(
+                drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_MULTIPROCESSOR_COUNT,
+                device_id,
             )
-
-    def test_greencontext_disjoint_split_broadcasts_scalars(self):
-        from torch.cuda import green_contexts
-
-        split = green_contexts.GreenContextSplit(
-            num_sms=[8, 6, 0],
-            locality_domain_ids=None,
-            backfill=[False, True, True],
+        )
+        contexts = GreenContext.split(
             coscheduled_sm_count=2,
+            locality_domain_ids=tuple(range(count)),
+            device_id=device_id,
         )
         self.assertEqual(
-            green_contexts._normalize_disjoint_split(split),
-            (
-                (8, 6, 0),
-                (None, None, None),
-                (False, True, True),
-                (2, 2, 2),
-            ),
+            [context.locality_domain_id for context in contexts], list(range(count))
         )
         self.assertEqual(
-            green_contexts._normalize_disjoint_split(
-                green_contexts.GreenContextSplit(locality_domain_ids=0)
-            ),
-            ((0,), (0,), (False,), (0,)),
+            [context.sm_count for context in contexts], [sms_per_domain] * count
         )
+        self._check_disjoint_sm_ids(contexts, device)
+
+    @serialTest()
+    @skipIfNoGreenContextLocalization
+    @skipIfCudaMPS
+    def test_greencontext_locality_recursive_split(self, device):
+        from torch.cuda.green_contexts import GreenContext, SMPartition
+
+        count = torch.cuda.green_contexts.get_num_locality_domains(device)
+        source = SMPartition.from_device(torch.device(device).index)
+        (first,), rest = source.split(
+            num_sms=4, coscheduled_sm_count=2, locality_domain_ids=0
+        )
+        rest_ctx = GreenContext(sm_partition=rest)
+        (second, unconstrained), rest = rest_ctx.sm_partition.split(
+            num_sms=(4, 4),
+            coscheduled_sm_count=2,
+            locality_domain_ids=(count - 1, None),
+        )
+        self.assertEqual(first.locality_domain_id, 0)
+        self.assertEqual(second.locality_domain_id, count - 1)
+        self.assertEqual(rest.sm_count, source.sm_count - 12)
+        parent = GreenContext(sm_partition=first)
+        (child,), rest = parent.sm_partition.split(
+            num_sms=2, coscheduled_sm_count=2, locality_domain_ids=0
+        )
+        self.assertEqual((child.sm_count, rest.sm_count), (2, 2))
+        self.assertEqual(child.locality_domain_id, 0)
+        contexts = [
+            GreenContext(sm_partition=p) for p in (child, second, unconstrained)
+        ]
+        self.assertEqual([context.sm_count for context in contexts], [2, 4, 4])
+        self.assertEqual(
+            [context.locality_domain_id for context in contexts],
+            [0, count - 1, None],
+        )
+        self._check_disjoint_sm_ids(contexts, device)
+
+    @skipIfNoGreenContextLocalization
+    def test_greencontext_locality_backfill(self, device):
+        from torch.cuda.green_contexts import SMPartition
+
+        source = SMPartition.from_device(torch.device(device).index)
+        with self.assertRaises(RuntimeError):
+            source.split(
+                num_sms=source.sm_count, coscheduled_sm_count=2, locality_domain_ids=0
+            )
+        (partition,), rest = source.split(
+            num_sms=source.sm_count,
+            coscheduled_sm_count=2,
+            locality_domain_ids=0,
+            backfill=True,
+        )
+        self.assertEqual(partition.sm_count, source.sm_count)
+        self.assertIsNone(rest)
+
+    @unittest.skipIf(
+        not PLATFORM_SUPPORTS_WORKQUEUE_CONFIG, "Disjoint SM splits are not supported"
+    )
+    def test_greencontext_split_broadcasts_scalars(self, device):
+        from torch.cuda.green_contexts import SMPartition
+
+        source = SMPartition.from_device(torch.device(device).index)
+        parts, remainder = source.split(
+            num_sms=2,
+            coscheduled_sm_count=[2, 2],
+            backfill=[False, True],
+        )
+        self.assertEqual([part.sm_count for part in parts], [2, 2])
+        self.assertIsNotNone(remainder)
+        self.assertEqual(remainder.sm_count, source.sm_count - 4)
+
+    def test_greencontext_partition_constructor_arguments(self, device):
+        from torch.cuda.green_contexts import GreenContext, SMPartition
+
+        source = SMPartition.from_device(torch.device(device).index)
+        with self.assertRaisesRegex(ValueError, "device_id must match"):
+            GreenContext(sm_partition=source, device_id=source.device_id + 1)
+        with self.assertRaisesRegex(RuntimeError, "cannot be specified together"):
+            GreenContext(num_sms=2, sm_partition=source)
+        with self.assertRaisesRegex(TypeError, "must be an SMPartition"):
+            GreenContext(sm_partition=object())
 
     @unittest.skipIf(
         not PLATFORM_SUPPORTS_WORKQUEUE_CONFIG, "Workqueue config is not supported"
@@ -12774,207 +13016,6 @@ class TestCudaGreenContexts(TestCase):
             green_contexts.execute_in_green_contexts(streams, fail)
 
         self.assertEqual(torch.cuda.current_stream(), caller_stream)
-
-    @serialTest()
-    @skipIfNoGreenContextLocalization
-    def test_greencontext_locality_backfill(self):
-        from torch.cuda import green_contexts
-
-        device_id = torch.cuda.current_device()
-        num_domains = green_contexts.get_num_locality_domains(device_id)
-        drv_device = green_contexts._check_cuda_bindings(
-            green_contexts._drv.cuDeviceGet(device_id)
-        )
-        sm_resource = green_contexts._check_cuda_bindings(
-            green_contexts._drv.cuDeviceGetDevResource(
-                drv_device,
-                green_contexts._drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
-            )
-        )
-        if sm_resource.sm.smCount % num_domains != 0:
-            self.skipTest("Device SM count is not evenly divisible by locality domains")
-        expected_sms = sm_resource.sm.smCount // num_domains
-        split = green_contexts.GreenContextSplit(
-            num_sms=expected_sms,
-            locality_domain_ids=tuple(range(num_domains)),
-            backfill=True,
-        )
-
-        resources, remainder = green_contexts._get_disjoint_sm_resources(
-            device_id, split
-        )
-        self.assertEqual(len(resources), num_domains)
-        self.assertTrue(
-            all(resource.sm.smCount == expected_sms for resource in resources)
-        )
-        self.assertEqual(remainder.sm.smCount, 0)
-
-        contexts, context_remainder = green_contexts.GreenContext.split(
-            split, device_id=device_id
-        )
-        self.assertEqual(len(contexts), num_domains)
-        self.assertIsNone(context_remainder)
-        for domain_id, context in enumerate(contexts):
-            self.assertEqual(context.sm_count, expected_sms)
-            self.assertEqual(context.locality_domain_id, domain_id)
-            self.assertTrue(context.has_locality_domain)
-
-    @serialTest()
-    @skipIfNoGreenContextLocalization
-    def test_greencontext_locality_discovery(self):
-        from torch.cuda import green_contexts
-
-        device_id = torch.cuda.current_device()
-        num_domains = green_contexts.get_num_locality_domains(device_id)
-        split = green_contexts.GreenContextSplit(
-            locality_domain_ids=tuple(range(num_domains))
-        )
-        resources, _remainder = green_contexts._get_disjoint_sm_resources(
-            device_id, split
-        )
-        self.assertEqual(len(resources), num_domains)
-        self.assertTrue(all(resource.sm.smCount > 0 for resource in resources))
-
-    @serialTest()
-    @skipIfNoGreenContextLocalization
-    def test_greencontext_mixed_locality_domains(self):
-        from torch.cuda import green_contexts
-
-        device_id = torch.cuda.current_device()
-        num_domains = green_contexts.get_num_locality_domains(device_id)
-        drv_device = green_contexts._check_cuda_bindings(
-            green_contexts._drv.cuDeviceGet(device_id)
-        )
-        sm_resource = green_contexts._check_cuda_bindings(
-            green_contexts._drv.cuDeviceGetDevResource(
-                drv_device,
-                green_contexts._drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
-            )
-        )
-        group_size = max(
-            sm_resource.sm.minSmPartitionSize,
-            sm_resource.sm.smCoscheduledAlignment,
-        )
-        locality_domain_ids = (0, num_domains - 1, None)
-        if sm_resource.sm.smCount <= len(locality_domain_ids) * group_size:
-            self.skipTest("Device does not have enough SMs for the requested groups")
-
-        contexts, remainder = green_contexts.GreenContext.split(
-            green_contexts.GreenContextSplit(
-                num_sms=group_size,
-                locality_domain_ids=locality_domain_ids,
-            ),
-            device_id=device_id,
-        )
-        resources = tuple(
-            green_contexts._check_cuda_bindings(
-                green_contexts._drv.cuGreenCtxGetDevResource(
-                    context._green_ctx,
-                    green_contexts._drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
-                )
-            )
-            for context in contexts
-        )
-        locality_flag = green_contexts._drv.CUdevSmResourceGroup_flags.CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_ID
-        self.assertEqual(
-            tuple(resource.sm.smCount for resource in resources), (group_size,) * 3
-        )
-        self.assertEqual(
-            tuple(
-                resource.sm.localityDomainId
-                if resource.sm.flags & locality_flag
-                else None
-                for resource in resources
-            ),
-            locality_domain_ids,
-        )
-        self.assertEqual(
-            tuple(context.locality_domain_id for context in contexts),
-            locality_domain_ids,
-        )
-        self.assertIsNotNone(remainder)
-        self.assertEqual(
-            remainder.sm_count,
-            sm_resource.sm.smCount - len(locality_domain_ids) * group_size,
-        )
-
-    @serialTest()
-    @skipIfNoGreenContextLocalization
-    def test_greencontext_coscheduled_sm_count(self):
-        from torch.cuda import green_contexts
-
-        device_id = torch.cuda.current_device()
-        coscheduled_sm_count = 2
-        context = green_contexts.GreenContext.create(
-            disjoint_split=(
-                green_contexts.GreenContextSplit(
-                    locality_domain_ids=0,
-                    coscheduled_sm_count=coscheduled_sm_count,
-                ),
-                0,
-            ),
-            device_id=device_id,
-        )
-        resource = green_contexts._check_cuda_bindings(
-            green_contexts._drv.cuGreenCtxGetDevResource(
-                context._green_ctx,
-                green_contexts._drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
-            )
-        )
-        self.assertEqual(resource.sm.smCoscheduledAlignment, coscheduled_sm_count)
-
-    @unittest.skipIf(
-        not PLATFORM_SUPPORTS_WORKQUEUE_CONFIG,
-        "Disjoint SM splits are not supported",
-    )
-    @parametrize("coscheduled_sm_count", [-1, 1, 34, True])
-    def test_greencontext_invalid_coscheduled_sm_count(self, coscheduled_sm_count):
-        from torch.cuda import green_contexts
-
-        device_id = torch.cuda.current_device()
-        with self.assertRaisesRegex(
-            RuntimeError,
-            "coscheduled_sm_count must be 0 or a multiple of 2 between 2 and",
-        ):
-            green_contexts.GreenContext(
-                disjoint_split=(
-                    green_contexts.GreenContextSplit(
-                        coscheduled_sm_count=coscheduled_sm_count,
-                    ),
-                    0,
-                ),
-                device_id=device_id,
-            )
-
-    @unittest.skipIf(
-        not PLATFORM_SUPPORTS_WORKQUEUE_CONFIG,
-        "Disjoint SM splits are not supported",
-    )
-    @serialTest()
-    def test_greencontext_backfill_relaxes_coscheduled_alignment(self):
-        from torch.cuda import green_contexts
-
-        device_id = torch.cuda.current_device()
-        if torch.cuda.get_device_capability(device_id)[0] < 9:
-            self.skipTest("Test requires support for coscheduled_sm_count=4")
-
-        split = green_contexts.GreenContextSplit(
-            num_sms=6,
-            backfill=True,
-            coscheduled_sm_count=4,
-        )
-        context = green_contexts.GreenContext(
-            disjoint_split=(split, 0), device_id=device_id
-        )
-        self.assertEqual(context.sm_count, 6)
-
-        with self.assertRaisesRegex(
-            RuntimeError, "without backfill it must also be a multiple"
-        ):
-            green_contexts.GreenContext(
-                disjoint_split=(split._replace(backfill=False), 0),
-                device_id=device_id,
-            )
 
 
 class TestCudaArchList(TestCase):

@@ -38,14 +38,11 @@ def _ensure_cuda_bindings_version(version: int, message: str) -> None:
     try:
         # Prereleases compare as their target release, e.g. 13.4.0b1 as 13.4.0.
         release = Version(str(_cuda_bindings_version)).release
-        bindings_version = release[0] * 1000 + release[1] * 10
-        if len(release) > 2:
-            bindings_version += release[2]
     except Exception:
         raise RuntimeError(
             f"Invalid cuda.bindings version: '{_cuda_bindings_version}'"
         ) from None
-    if bindings_version < version:
+    if release[:2] < (version // 1000, version % 1000 // 10):
         raise RuntimeError(message)
 
 

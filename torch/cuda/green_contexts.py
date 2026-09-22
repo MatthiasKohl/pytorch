@@ -6,7 +6,7 @@ import threading
 import warnings
 import weakref
 from collections.abc import Sequence
-from typing import Any, NamedTuple, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 from typing_extensions import deprecated
 
 import torch
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "GreenContext",
-    "GreenContextSplit",
+    "SMPartition",
     "execute_in_green_contexts",
     "get_green_context_from_stream",
     "get_num_locality_domains",
@@ -35,6 +35,7 @@ __all__ = [
 ]
 
 _STREAMS_PER_GREEN_CONTEXT_POOL = 32
+_NVML_ERROR_NOT_SUPPORTED = 3
 _NVML_DEVICE_MIG_ENABLE = 1
 _NVML_GPU_VIRTUALIZATION_MODE_VGPU = 2
 
@@ -53,39 +54,6 @@ _STREAM_TO_GREEN_CTX: weakref.WeakValueDictionary[int, GreenContext] = (
     weakref.WeakValueDictionary()
 )
 _STREAM_TO_GREEN_CTX_LOCK = threading.RLock()
-
-
-class GreenContextSplit(NamedTuple):
-    r"""Describe the SM groups in a disjoint Green Context split.
-
-    Each field may be a sequence with one entry per group or a scalar, which is
-    broadcast across all groups. If every field is scalar, the split has one
-    group. All sequence fields must have the same length.
-
-    A ``num_sms`` entry of zero enables driver discovery mode. The driver
-    derives the largest group satisfying that entry's constraints from the SMs
-    available when it is evaluated. Groups are evaluated in order, so an early
-    discovery group, especially with backfill enabled, may leave no SMs for a
-    later group. If discovery resolves to zero SMs, that group cannot be used
-    to create a green context.
-
-    A non-``None`` ``locality_domain_ids`` entry constrains that group to the
-    corresponding locality domain. An entry of ``None`` leaves it unconstrained.
-    ``backfill`` relaxes co-scheduling and locality constraints as needed to
-    reach the requested ``num_sms``. It does not otherwise consume the
-    remainder. ``coscheduled_sm_count`` specifies the minimum number of SMs
-    guaranteed to be co-scheduled for a thread block cluster; zero selects the
-    device default.
-    """
-
-    num_sms: int | Sequence[int] = 0
-    locality_domain_ids: int | None | Sequence[int | None] = None
-    backfill: bool | Sequence[bool] = False
-    coscheduled_sm_count: int | Sequence[int] = 0
-
-
-class _EmptyGreenContextRemainderError(RuntimeError):
-    pass
 
 
 # note: this can safely be cached in a process/thread because
@@ -154,14 +122,6 @@ def _parse_workqueue_scope(workqueue_scope: str | None) -> int | None:
     return _WORKQUEUE_SCOPE_VALUES[workqueue_scope]
 
 
-# note: the following functions can be cached as well as the return values
-# cannot change during the lifetime of a process
-@functools.cache
-def _get_drv_device(device_id: int) -> Any:
-    # pyrefly: ignore [missing-attribute]
-    return _check_cuda_bindings(_drv.cuDeviceGet(device_id))
-
-
 def _uses_single_locality_domain_nvml(device: Device) -> bool | None:
     from ctypes import byref, c_int, c_uint, c_void_p, CDLL
 
@@ -175,50 +135,43 @@ def _uses_single_locality_domain_nvml(device: Device) -> bool | None:
             nvml_h.nvmlDeviceGetHandleByIndex_v2(device_index, byref(device_handle))
             != 0
         ):
-            raise RuntimeError(f"NVML cannot get handle for device {device_index}")
+            return None
 
-        virtualization_mode = c_int()
-        if (
-            nvml_h.nvmlDeviceGetVirtualizationMode(
-                device_handle, byref(virtualization_mode)
-            )
-            == 0
-            and virtualization_mode.value == _NVML_GPU_VIRTUALIZATION_MODE_VGPU
-        ):
+        vgpu_mode = c_int()
+        status = nvml_h.nvmlDeviceGetVirtualizationMode(device_handle, byref(vgpu_mode))
+        if status not in (0, _NVML_ERROR_NOT_SUPPORTED):
+            return None
+        if status == 0 and vgpu_mode.value == _NVML_GPU_VIRTUALIZATION_MODE_VGPU:
             return True
 
         is_mig_device = c_uint()
-        if (
-            nvml_h.nvmlDeviceIsMigDeviceHandle(device_handle, byref(is_mig_device)) == 0
-            and is_mig_device.value != 0
-        ):
+        status = nvml_h.nvmlDeviceIsMigDeviceHandle(device_handle, byref(is_mig_device))
+        if status not in (0, _NVML_ERROR_NOT_SUPPORTED):
+            return None
+        if status == 0 and is_mig_device.value != 0:
             return True
 
         current_mig_mode = c_uint()
         pending_mig_mode = c_uint()
-        if (
-            nvml_h.nvmlDeviceGetMigMode(
-                device_handle, byref(current_mig_mode), byref(pending_mig_mode)
-            )
-            == 0
-            and current_mig_mode.value == _NVML_DEVICE_MIG_ENABLE
-        ):
+        status = nvml_h.nvmlDeviceGetMigMode(
+            device_handle, byref(current_mig_mode), byref(pending_mig_mode)
+        )
+        if status not in (0, _NVML_ERROR_NOT_SUPPORTED):
+            return None
+        if status == 0 and current_mig_mode.value == _NVML_DEVICE_MIG_ENABLE:
             return True
 
         numa_node = c_uint()
-        return nvml_h.nvmlDeviceGetNumaNodeId(device_handle, byref(numa_node)) == 0
+        status = nvml_h.nvmlDeviceGetNumaNodeId(device_handle, byref(numa_node))
+        if status not in (0, _NVML_ERROR_NOT_SUPPORTED):
+            return None
+        return status == 0
     except (AttributeError, IndexError, OSError):
         return None
 
 
-@functools.cache
-def _get_num_locality_domains(device_id: int) -> int:
-    _ensure_supported()
-    _ensure_localization_supported()
-    # pyrefly: ignore [missing-attribute]
-    device_result = _drv.cuDeviceGet(device_id)
-    # pyrefly: ignore [missing-attribute]
-    if device_result[0] == _drv.CUresult.CUDA_ERROR_NOT_INITIALIZED:
+def _get_num_locality_domains_nvml() -> int | None:
+    try:
         # Without initializing the CUDA driver/context, we can only determine
         # locality domain support under certain conditions:
         # all NVML devices visible through `CUDA_VISIBLE_DEVICES` must agree;
@@ -242,30 +195,48 @@ def _get_num_locality_domains(device_id: int) -> int:
             return 1
         num_nvml_devices = torch.cuda._device_count_nvml()
         if num_nvml_devices <= 0:
-            raise RuntimeError(
-                "Cannot determine the locality domain count before CUDA "
-                "initialization because NVML device count is not available"
-            )
-        loc_domains = []
-        for nvml_id in range(num_nvml_devices):
-            capability = torch.cuda._raw_device_capability_nvml(nvml_id)
-            single_domain = _uses_single_locality_domain_nvml(nvml_id)
-            if single_domain is None or capability is None:
-                raise RuntimeError(
-                    "Cannot determine the locality domain count before CUDA "
-                    "initialization because NVML device queries failed for "
-                    "some visible device(s)"
+            reason = "NVML device count is not available"
+        else:
+            loc_domains = set()
+            for nvml_id in range(num_nvml_devices):
+                capability = torch.cuda._raw_device_capability_nvml(nvml_id)
+                single_domain = _uses_single_locality_domain_nvml(nvml_id)
+                if single_domain is None or capability is None:
+                    reason = f"NVML device queries failed for visible device {nvml_id}"
+                    break
+                loc_domains.add(2 if not single_domain and capability[0] == 10 else 1)
+            else:
+                if len(loc_domains) == 1:
+                    return loc_domains.pop()
+                reason = (
+                    "visible NVML devices have different inferred locality domain "
+                    f"counts: {sorted(loc_domains)}"
                 )
-            loc_domains.append(2 if not single_domain and capability[0] == 10 else 1)
-        unique_loc_domains = set(loc_domains)
-        if len(unique_loc_domains) != 1:
-            raise RuntimeError(
-                "Cannot determine the locality domain count before CUDA "
-                "initialization because visible NVML devices have different "
-                "inferred locality domain counts: "
-                f"{sorted(unique_loc_domains)}"
-            )
-        return loc_domains[0]
+    except (AttributeError, IndexError, OSError, RuntimeError, ValueError) as error:
+        reason = str(error)
+    warnings.warn(
+        f"Cannot determine the locality domain count using NVML: {reason}. "
+        "Falling back to CUDA driver initialization, which may poison subsequent "
+        "forks that use CUDA.",
+        stacklevel=3,
+    )
+    return None
+
+
+@functools.cache
+def _get_num_locality_domains(device_id: int) -> int:
+    _ensure_supported()
+    _ensure_localization_supported()
+    # pyrefly: ignore [missing-attribute]
+    device_result = _drv.cuDeviceGet(device_id)
+    # pyrefly: ignore [missing-attribute]
+    if device_result[0] == _drv.CUresult.CUDA_ERROR_NOT_INITIALIZED:
+        count = _get_num_locality_domains_nvml()
+        if count is not None:
+            return count
+        _check_cuda_bindings(_drv.cuInit(0))  # pyrefly: ignore [missing-attribute]
+        # pyrefly: ignore [missing-attribute]
+        device_result = _drv.cuDeviceGet(device_id)
     device = _check_cuda_bindings(device_result)
     return _check_cuda_bindings(
         # pyrefly: ignore [missing-attribute]
@@ -275,38 +246,6 @@ def _get_num_locality_domains(device_id: int) -> int:
             device,
         )
     )
-
-
-@functools.cache
-def _get_dev_major(device_id: int) -> int:
-    device = _get_drv_device(device_id)
-    return _check_cuda_bindings(
-        # pyrefly: ignore [missing-attribute]
-        _drv.cuDeviceGetAttribute(
-            # pyrefly: ignore [missing-attribute]
-            _drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-            device,
-        )
-    )
-
-
-def _validate_coscheduled_sm_count(device_id: int, coscheduled_sm_count: int) -> None:
-    # Non-zero values must be multiples of 2; the maximum is 32 on CC 9.0+
-    # and 2 on earlier architectures.
-    # https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GREEN__CONTEXTS.html
-    max_coscheduled_count = 2 if _get_dev_major(device_id) < 9 else 32
-    if (
-        not isinstance(coscheduled_sm_count, int)
-        # note: python treats bool as int which we want to avoid here
-        or isinstance(coscheduled_sm_count, bool)
-        or coscheduled_sm_count < 0
-        or coscheduled_sm_count > max_coscheduled_count
-        or coscheduled_sm_count % 2 != 0
-    ):
-        raise RuntimeError(
-            "coscheduled_sm_count must be 0 or a multiple of 2 between 2 and "
-            f"{max_coscheduled_count}, inclusive"
-        )
 
 
 def _ensure_primary_context() -> None:
@@ -323,214 +262,260 @@ def _ensure_primary_context() -> None:
     _check_cuda_bindings(_rt.cudaFree(0))
 
 
-def _split_sm_resources(
-    sm_resource: Any,
-    sm_counts: tuple[int, ...],
-    locality_domain_ids: tuple[int | None, ...],
-    backfill: tuple[bool, ...],
-    coscheduled_sm_counts: tuple[int, ...],
-) -> tuple[tuple[Any, ...], Any]:
-    params = []
-    for sm_count, domain_id, use_backfill, coscheduled_sm_count in zip(
-        sm_counts, locality_domain_ids, backfill, coscheduled_sm_counts
-    ):
-        # pyrefly: ignore [missing-attribute]
-        param = _drv.CU_DEV_SM_RESOURCE_GROUP_PARAMS()
-        param.smCount = sm_count
-        param.coscheduledSmCount = coscheduled_sm_count
-        param.flags = (
-            # pyrefly: ignore [missing-attribute]
-            _drv.CUdevSmResourceGroup_flags.CU_DEV_SM_RESOURCE_GROUP_DEFAULT
-        )
-        if domain_id is not None:
-            param.flags |= (
-                # pyrefly: ignore [missing-attribute]
-                _drv.CUdevSmResourceGroup_flags.CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_ID
-            )
-            param.localityDomainId = domain_id
-        if use_backfill:
-            param.flags |= (
-                # pyrefly: ignore [missing-attribute]
-                _drv.CUdevSmResourceGroup_flags.CU_DEV_SM_RESOURCE_GROUP_BACKFILL
-            )
-        params.append(param)
-
-    split_result, remainder = _check_cuda_bindings(
-        # pyrefly: ignore [missing-attribute]
-        _drv.cuDevSmResourceSplit(
-            len(params),
-            sm_resource,
-            0,
-            params,
-        )
-    )
-    return tuple(split_result), remainder
-
-
-def _normalize_disjoint_split(
-    sm_split: GreenContextSplit,
-) -> tuple[
-    tuple[int, ...],
-    tuple[int | None, ...],
-    tuple[bool, ...],
-    tuple[int, ...],
-]:
-    if not isinstance(sm_split, GreenContextSplit):
-        raise RuntimeError("disjoint_split must contain a GreenContextSplit")
-
-    fields = (
-        ("num_sms", sm_split.num_sms),
-        ("locality_domain_ids", sm_split.locality_domain_ids),
-        ("backfill", sm_split.backfill),
-        ("coscheduled_sm_count", sm_split.coscheduled_sm_count),
-    )
-    sequences = {
-        name: tuple(value)
-        for name, value in fields
-        if isinstance(value, Sequence) and not isinstance(value, (str, bytes))
-    }
-    lengths = {len(value) for value in sequences.values()}
-    if not lengths:
-        num_groups = 1
-    elif len(lengths) != 1:
-        raise RuntimeError(
-            "All sequence fields in GreenContextSplit must have the same length"
-        )
-    else:
-        num_groups = lengths.pop()
-    if num_groups == 0:
-        raise RuntimeError("GreenContextSplit must contain at least one group")
-
-    def broadcast(name: str, value: Any) -> tuple[Any, ...]:
-        if name in sequences:
-            return sequences[name]
-        return (value,) * num_groups
-
-    return (
-        broadcast("num_sms", sm_split.num_sms),
-        broadcast("locality_domain_ids", sm_split.locality_domain_ids),
-        broadcast("backfill", sm_split.backfill),
-        broadcast("coscheduled_sm_count", sm_split.coscheduled_sm_count),
-    )
-
-
-def _get_disjoint_sm_resources(
-    device_id: int,
-    sm_split: GreenContextSplit,
-) -> tuple[tuple[Any, ...], Any]:
-    return _get_disjoint_sm_resources_cached(
-        device_id, *_normalize_disjoint_split(sm_split)
-    )
-
-
-@functools.cache
-def _get_disjoint_sm_resources_cached(
-    device_id: int,
-    sm_counts: tuple[int, ...],
-    locality_domain_ids: tuple[int | None, ...],
-    backfill: tuple[bool, ...],
-    coscheduled_sm_counts: tuple[int, ...],
-) -> tuple[tuple[Any, ...], Any]:
-    _ensure_disjoint_sm_split_supported()
-    if any(not isinstance(value, bool) for value in backfill):
-        raise RuntimeError("GreenContextSplit backfill entries must be bool values")
-    for coscheduled_sm_count in coscheduled_sm_counts:
-        _validate_coscheduled_sm_count(device_id, coscheduled_sm_count)
-    if any(domain_id is not None for domain_id in locality_domain_ids):
-        _ensure_localization_supported()
-
-    device = _get_drv_device(device_id)
-    sm_resource = _check_cuda_bindings(
-        # pyrefly: ignore [missing-attribute]
-        _drv.cuDeviceGetDevResource(
-            device,
-            # pyrefly: ignore [missing-attribute]
-            _drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
-        )
-    )
-    default_coscheduled_count = sm_resource.sm.smCoscheduledAlignment
-    for sm_count, use_backfill, coscheduled_sm_count in zip(
-        sm_counts, backfill, coscheduled_sm_counts
-    ):
-        effective_coscheduled_count = coscheduled_sm_count or default_coscheduled_count
-        if (
-            not isinstance(sm_count, int)
-            or isinstance(sm_count, bool)
-            or sm_count < 0
-            or (sm_count != 0 and sm_count < effective_coscheduled_count)
-            or sm_count % 2 != 0
-            or (
-                sm_count != 0
-                and not use_backfill
-                and sm_count % effective_coscheduled_count != 0
-            )
-        ):
-            raise RuntimeError(
-                "Invalid number of SMs requested in GreenContextSplit: each count must be 0 "
-                "for discovery or an even value at least as large as its "
-                "effective coscheduled SM count; without backfill it must also "
-                f"be a multiple of that count, got {sm_count}"
-            )
-    requested_sm_count = sum(sm_counts)
-    if requested_sm_count > sm_resource.sm.smCount:
-        raise RuntimeError(
-            "Invalid total number of SMs requested in GreenContextSplit: "
-            f"{requested_sm_count} (device has {sm_resource.sm.smCount} SMs)"
-        )
-
-    localized_ids = [
-        domain_id for domain_id in locality_domain_ids if domain_id is not None
-    ]
-    if localized_ids:
-        num_domains = get_num_locality_domains(device_id)
-        if num_domains <= 1:
-            raise RuntimeError(f"Localization is not supported on device {device_id}")
-        for domain_id in localized_ids:
-            if (
-                not isinstance(domain_id, int)
-                or isinstance(domain_id, bool)
-                or domain_id < 0
-                or domain_id >= num_domains
-            ):
-                raise RuntimeError(
-                    "Invalid locality domain ID in GreenContextSplit: "
-                    f"{domain_id} (device has {num_domains})"
-                )
-
-    return _split_sm_resources(
-        sm_resource,
-        sm_counts,
-        locality_domain_ids,
-        backfill,
-        coscheduled_sm_counts,
-    )
-
-
 def get_num_locality_domains(device: Device = None) -> int:
-    r"""Return the number of CUDA locality domains for a device."""
-    if torch.cuda.is_initialized():
-        device_id = _get_device_index(device, optional=True)
-    elif device is None:
-        device_id = 0
-    else:
-        parsed_device = torch.device(device) if isinstance(device, str) else device
-        if (
-            isinstance(parsed_device, torch.device)
-            and parsed_device.type == "cuda"
-            and parsed_device.index is None
-        ):
+    r"""Return the number of CUDA locality domains, or one if unavailable.
+
+    Accepts a device index, CUDA device string, or :class:`torch.device`.
+    Before CUDA initialization, first tries NVML without initializing the driver.
+    If NVML cannot determine the count, warns and initializes the driver to query
+    it directly. This fallback may poison subsequent forks that use CUDA.
+    """
+    try:
+        if torch.cuda.is_initialized():
+            device_id = _get_device_index(device, optional=True)
+        elif device is None:
             device_id = 0
         else:
-            device_id = _get_device_index(device)
-    try:
+            parsed_device = torch.device(device) if isinstance(device, str) else device
+            if (
+                isinstance(parsed_device, torch.device)
+                and parsed_device.type == "cuda"
+                and parsed_device.index is None
+            ):
+                device_id = 0
+            else:
+                device_id = _get_device_index(device)
         return _get_num_locality_domains(device_id)
-    except RuntimeError:
+    except (RuntimeError, ValueError, TypeError):
         return 1
 
 
 def is_localization_supported(device: Device = None) -> bool:
     r"""Return whether CUDA green context localization is available."""
     return get_num_locality_domains(device) > 1
+
+
+class SMPartition:
+    r"""An SM resource selected by CUDA, with its device and allocation metadata.
+
+    Obtain resources with :meth:`from_device`, :meth:`split`, or
+    :attr:`GreenContext.sm_partition`. Construct a :class:`GreenContext` with
+    ``sm_partition=partition`` to run work on the selected SMs.
+
+    A partition describes a set of SMs; it does not reserve them against other
+    contexts. Reusing a partition for multiple contexts shares those SMs.
+    """
+
+    def __init__(
+        self,
+        _resource: Any,
+        _device_id: int,
+        _owner: SMPartition | GreenContext | None = None,
+    ) -> None:
+        self._resource = _resource
+        self._device_id = _device_id
+        self._owner = _owner
+
+    @classmethod
+    def from_device(cls, device_id: int | None = None) -> SMPartition:
+        r"""Return the full device SM resource.
+
+        Initializes the CUDA driver. If ``device_id`` is omitted, uses the
+        current PyTorch device, initializing PyTorch CUDA state if necessary.
+        """
+        _ensure_supported()
+        if device_id is None:
+            device_id = torch.cuda.current_device()
+        _check_cuda_bindings(_drv.cuInit(0))  # pyrefly: ignore [missing-attribute]
+        # pyrefly: ignore [missing-attribute]
+        device = _check_cuda_bindings(_drv.cuDeviceGet(device_id))
+        resource = _check_cuda_bindings(
+            _drv.cuDeviceGetDevResource(  # pyrefly: ignore [missing-attribute]
+                device,
+                _drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,  # pyrefly: ignore [missing-attribute]
+            )
+        )
+        return cls(resource, device_id)
+
+    @property
+    def device_id(self) -> int:
+        r"""The device index of this SM resource."""
+        return self._device_id
+
+    @property
+    def sm_count(self) -> int:
+        r"""The actual number of SMs in this resource."""
+        return self._resource.sm.smCount
+
+    @property
+    def coscheduled_sm_count(self) -> int:
+        r"""The co-scheduled SM alignment reported by CUDA for this resource."""
+        return self._resource.sm.smCoscheduledAlignment
+
+    @property
+    def locality_domain_id(self) -> int | None:
+        r"""The locality domain reported by CUDA, or ``None`` if unspecified.
+
+        Returns ``None`` if locality queries require newer CUDA software.
+        This reads metadata, not the physical locality of every selected SM.
+        """
+        try:
+            _ensure_localization_supported()
+        except RuntimeError:
+            return None
+        # Nested splits need not inherit locality metadata. Backfill may also
+        # include SMs outside this domain; an ID is not a containment guarantee.
+        flag = (
+            # pyrefly: ignore [missing-attribute]
+            _drv.CUdevSmResourceGroup_flags.CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_ID
+        )
+        if self._resource.sm.flags & flag:
+            return self._resource.sm.localityDomainId
+        return None
+
+    def split(
+        self,
+        *,
+        num_sms: int | Sequence[int] = 0,
+        coscheduled_sm_count: int | Sequence[int] = 0,
+        preferred_coscheduled_sm_count: int | Sequence[int] = 0,
+        backfill: bool | Sequence[bool] = False,
+        locality_domain_ids: int | None | Sequence[int | None] = None,
+    ) -> tuple[tuple[SMPartition, ...], SMPartition | None]:
+        r"""Split this resource into disjoint groups and an optional remainder.
+
+        Requires CUDA driver and bindings 13.1+. CUDA checks the requested
+        counts and hardware constraints; counts are not automatically rounded.
+        A count of zero requests discovery of the largest remaining group
+        satisfying its constraints. Groups are processed in order.
+
+        Args:
+            num_sms (int or sequence of int): SM count for each requested group.
+                Zero enables discovery mode. Default: ``0``.
+            coscheduled_sm_count (int or sequence of int, optional): Co-scheduled
+                SM grouping size for thread-block clusters. Zero lets CUDA
+                determine cluster capabilities from the selected resources.
+                Default: ``0``.
+            preferred_coscheduled_sm_count (int or sequence of int, optional):
+                Preferred larger grouping size, when CUDA can combine groups.
+                Zero selects the CUDA default. Default: ``0``.
+            backfill (bool or sequence of bool, optional): Allow CUDA to fill
+                groups with SMs outside the co-scheduling or locality constraints.
+                Default: ``False``.
+            locality_domain_ids (int, None, or sequence of int or None, optional):
+                Select SMs from these locality domains during splitting. ``None``
+                leaves locality unconstrained. Requires CUDA driver and bindings
+                13.4+ when any domain is specified. Default: ``None``.
+
+        Each option can be a scalar or a sequence. All sequences must have the
+        same nonzero length; scalars are broadcast to that length. If every
+        option is scalar, the split has one group.
+
+        An early discovery group, especially with backfill, may leave no SMs
+        for later groups. CUDA rejects groups resolving to zero SMs. Backfill
+        relaxes constraints to reach a requested count; it does not otherwise
+        consume the remainder.
+        Returns ``(partitions, remainder)``, with ``None`` for an empty remainder.
+        The remainder does not inherit the requested alignment.
+
+        To subdivide a returned partition or remainder, create a
+        :class:`GreenContext` from it and split the context's queried
+        :attr:`~GreenContext.sm_partition`. CUDA drivers can reject raw split
+        outputs as already partitioned resources. Context creation is explicit.
+
+        Children are subsets of this resource and overlap it. Siblings from
+        this operation, including the remainder, are disjoint. Results from
+        separate split operations may overlap.
+
+        Example::
+
+            >>> sms = SMPartition.from_device(device_id=0)
+            >>> (first,), rest = sms.split(num_sms=4, coscheduled_sm_count=2)
+            >>> rest_ctx = GreenContext(sm_partition=rest)
+            >>> (second,), rest = rest_ctx.sm_partition.split(
+            ...     num_sms=4, coscheduled_sm_count=2
+            ... )
+        """
+        _ensure_disjoint_sm_split_supported()
+        fields = {
+            "num_sms": num_sms,
+            "coscheduled_sm_count": coscheduled_sm_count,
+            "preferred_coscheduled_sm_count": preferred_coscheduled_sm_count,
+            "backfill": backfill,
+            "locality_domain_ids": locality_domain_ids,
+        }
+        sequences = {
+            name: tuple(value)
+            for name, value in fields.items()
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes))
+        }
+        lengths = {len(value) for value in sequences.values()}
+        if len(lengths) > 1:
+            raise ValueError("All sequence options must have the same length")
+        count = lengths.pop() if lengths else 1
+        if count == 0:
+            raise ValueError("A split must contain at least one group")
+        values = {
+            name: sequences[name] if name in sequences else (value,) * count
+            for name, value in fields.items()
+        }
+        counts = values["num_sms"]
+        co_counts = values["coscheduled_sm_count"]
+        preferred = values["preferred_coscheduled_sm_count"]
+        backfills = values["backfill"]
+        domains = values["locality_domain_ids"]
+        if any(domain is not None for domain in domains):
+            _ensure_localization_supported()
+        for domain in domains:
+            if domain is not None and (
+                not isinstance(domain, int) or isinstance(domain, bool) or domain < 0
+            ):
+                raise ValueError(
+                    "locality_domain_ids entries must be nonnegative integers or None"
+                )
+        for name, values in (
+            ("num_sms", counts),
+            ("coscheduled_sm_count", co_counts),
+            ("preferred_coscheduled_sm_count", preferred),
+        ):
+            for value in values:
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    msg = f"{name} entries must be nonnegative integers, got {value!r}"
+                    raise ValueError(msg)
+        if any(not isinstance(value, bool) for value in backfills):
+            raise ValueError("backfill entries must be bool values")
+        params = []
+        for index, count in enumerate(counts):
+            # pyrefly: ignore [missing-attribute]
+            param = _drv.CU_DEV_SM_RESOURCE_GROUP_PARAMS()
+            param.smCount = count
+            param.coscheduledSmCount = co_counts[index]
+            param.preferredCoscheduledSmCount = preferred[index]
+            if backfills[index]:
+                param.flags = (
+                    # pyrefly: ignore [missing-attribute]
+                    _drv.CUdevSmResourceGroup_flags.CU_DEV_SM_RESOURCE_GROUP_BACKFILL
+                )
+            if domains[index] is not None:
+                param.flags |= (
+                    # pyrefly: ignore [missing-attribute]
+                    _drv.CUdevSmResourceGroup_flags.CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_ID
+                )
+                param.localityDomainId = domains[index]
+            params.append(param)
+        resources, remainder = _check_cuda_bindings(
+            # pyrefly: ignore [missing-attribute]
+            _drv.cuDevSmResourceSplit(len(params), self._resource, 0, params)
+        )
+        children = tuple(SMPartition(r, self.device_id, self) for r in resources)
+        remaining = None
+        is_sm_resource = (
+            # pyrefly: ignore [missing-attribute]
+            remainder.type == _drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
+        )
+        if is_sm_resource and remainder.sm.smCount:
+            remaining = SMPartition(remainder, self.device_id, self)
+        return children, remaining
 
 
 class GreenContext:
@@ -565,15 +550,15 @@ class GreenContext:
         num_sms: int | None = None,
         workqueue_scope: str | None = None,
         workqueue_concurrency_limit: int | None = None,
-        disjoint_split: tuple[GreenContextSplit, int] | None = None,
+        sm_partition: SMPartition | None = None,
         device_id: int | None = None,
         green_context_obj: Any | None = None,
     ) -> None:
         r"""Create a CUDA green context.
 
         At least one of ``num_sms``, ``workqueue_scope``, or
-        ``disjoint_split`` must be specified. ``num_sms`` and
-        ``disjoint_split`` cannot be specified together.
+        ``sm_partition`` must be specified. ``num_sms`` and
+        ``sm_partition`` cannot be specified together.
 
         If ``green_context_obj`` is used, the context will wrap the given
         green context. In this case, no other argument can be specified
@@ -590,10 +575,9 @@ class GreenContext:
             workqueue_concurrency_limit (int, optional): Maximum number of
                 concurrent stream-ordered workloads for the workqueue. Requires
                 ``workqueue_scope`` to be set.
-            disjoint_split (tuple[GreenContextSplit, int], optional): A disjoint
-                SM split and
-                the index of the group to use. An index equal to the number of
-                requested groups selects the remainder.
+            sm_partition (SMPartition, optional): Existing SM resources to use.
+                The context uses the partition's device. Reusing a partition
+                creates contexts sharing the same SMs.
             device_id (int, optional): The device index used.
                 When ``None``, the current device is used.
             green_context_obj (optional): Wrap this cuda-bindings green context.
@@ -616,7 +600,7 @@ class GreenContext:
                 num_sms,
                 workqueue_scope,
                 workqueue_concurrency_limit,
-                disjoint_split,
+                sm_partition,
                 device_id,
             ]
             if any(v is not None for v in other_values):
@@ -658,21 +642,25 @@ class GreenContext:
         scope_value = _parse_workqueue_scope(workqueue_scope)
         if scope_value is not None:
             _ensure_workqueue_supported()
-        if num_sms is None and scope_value is None and disjoint_split is None:
+        if sm_partition is not None and not isinstance(sm_partition, SMPartition):
+            raise TypeError("sm_partition must be an SMPartition")
+        if num_sms is None and scope_value is None and sm_partition is None:
             raise RuntimeError(
-                "At least one of num_sms, workqueue_scope, or disjoint_split "
+                "At least one of num_sms, workqueue_scope, or sm_partition "
                 "must be specified"
             )
-        if num_sms is not None and disjoint_split is not None:
-            raise RuntimeError(
-                "num_sms and disjoint_split cannot be specified together"
-            )
+        if num_sms is not None and sm_partition is not None:
+            raise RuntimeError("num_sms and sm_partition cannot be specified together")
         if workqueue_concurrency_limit is not None and scope_value is None:
             raise RuntimeError(
                 "workqueue_concurrency_limit requires workqueue_scope to be set"
             )
 
-        if device_id is None:
+        if sm_partition is not None:
+            if device_id is not None and device_id != sm_partition.device_id:
+                raise ValueError("device_id must match the SM partition's device")
+            device_id = sm_partition.device_id
+        elif device_id is None:
             device_id = torch.cuda.current_device()
 
         _ensure_primary_context()
@@ -704,29 +692,10 @@ class GreenContext:
                 raise RuntimeError("Failed to create single SM resource group")
             resources.append(split_result[0])
 
-        if disjoint_split is not None:
-            sm_split, group_index = disjoint_split
-            sm_counts, locality_domain_ids, _backfill, _coscheduled_sm_counts = (
-                _normalize_disjoint_split(sm_split)
-            )
-            if not isinstance(group_index, int) or isinstance(group_index, bool):
-                raise RuntimeError("disjoint_split group index must be an integer")
-            if group_index < 0 or group_index > len(sm_counts):
-                raise RuntimeError(
-                    "Invalid disjoint_split group index: "
-                    f"{group_index} (split has {len(sm_counts)} groups)"
-                )
-            split_resources, remainder = _get_disjoint_sm_resources(device_id, sm_split)
-            if group_index == len(sm_counts):
-                if remainder.sm.smCount == 0:
-                    raise _EmptyGreenContextRemainderError(
-                        "Cannot select the disjoint_split remainder because it is empty"
-                    )
-                resources.append(remainder)
-            else:
-                resources.append(split_resources[group_index])
-                locality_domain_id = locality_domain_ids[group_index]
-            if any(domain_id is not None for domain_id in locality_domain_ids):
+        if sm_partition is not None:
+            resources.append(sm_partition._resource)
+            locality_domain_id = sm_partition.locality_domain_id
+            if locality_domain_id is not None:
                 num_locality_domains = get_num_locality_domains(device_id)
 
         if scope_value is not None:
@@ -835,33 +804,44 @@ class GreenContext:
 
     @staticmethod
     def split(
-        sm_split: GreenContextSplit,
+        *,
+        num_sms: int | Sequence[int] = 0,
+        coscheduled_sm_count: int | Sequence[int] = 0,
+        preferred_coscheduled_sm_count: int | Sequence[int] = 0,
+        backfill: bool | Sequence[bool] = False,
+        locality_domain_ids: int | None | Sequence[int | None] = None,
+        workqueue_scope: str | None = None,
+        workqueue_concurrency_limit: int | None = None,
         device_id: int | None = None,
-    ) -> tuple[tuple[GreenContext, ...], GreenContext | None]:
-        r"""Create green contexts for every group in a disjoint SM split.
+    ) -> tuple[GreenContext, ...]:
+        r"""Create contexts backed by disjoint SM partitions of a device.
 
-        The returned tuple contains a tuple of contexts following the order of
-        ``sm_split.num_sms``, plus the remainder context if it is not empty.
+        Partition options are those of :meth:`SMPartition.split`. Workqueue
+        options are applied to each context. Unassigned SMs are unused; use
+        :meth:`SMPartition.split` to retain the remainder for later use.
 
-        Arguments:
-            sm_split (GreenContextSplit): The requested disjoint SM groups.
-            device_id (int, optional): The device index used. When ``None``,
-                the current device is used.
+        Example::
+
+            >>> a, b = GreenContext.split(
+            ...     num_sms=(24, 40), coscheduled_sm_count=8, device_id=0
+            ... )
         """
-        sm_counts, _locality_domain_ids, _backfill, _coscheduled_sm_counts = (
-            _normalize_disjoint_split(sm_split)
+        source = SMPartition.from_device(device_id)
+        partitions, _ = source.split(
+            num_sms=num_sms,
+            coscheduled_sm_count=coscheduled_sm_count,
+            preferred_coscheduled_sm_count=preferred_coscheduled_sm_count,
+            backfill=backfill,
+            locality_domain_ids=locality_domain_ids,
         )
-        contexts = [
-            GreenContext(disjoint_split=(sm_split, group_index), device_id=device_id)
-            for group_index in range(len(sm_counts))
-        ]
-        try:
-            remainder = GreenContext(
-                disjoint_split=(sm_split, len(sm_counts)), device_id=device_id
+        return tuple(
+            GreenContext(
+                sm_partition=partition,
+                workqueue_scope=workqueue_scope,
+                workqueue_concurrency_limit=workqueue_concurrency_limit,
             )
-        except _EmptyGreenContextRemainderError:
-            remainder = None
-        return tuple(contexts), remainder
+            for partition in partitions
+        )
 
     @staticmethod
     def create(
@@ -869,7 +849,7 @@ class GreenContext:
         num_sms: int | None = None,
         workqueue_scope: str | None = None,
         workqueue_concurrency_limit: int | None = None,
-        disjoint_split: tuple[GreenContextSplit, int] | None = None,
+        sm_partition: SMPartition | None = None,
         device_id: int | None = None,
     ) -> GreenContext:
         r"""Create a CUDA green context.
@@ -880,7 +860,7 @@ class GreenContext:
             num_sms=num_sms,
             workqueue_scope=workqueue_scope,
             workqueue_concurrency_limit=workqueue_concurrency_limit,
-            disjoint_split=disjoint_split,
+            sm_partition=sm_partition,
             device_id=device_id,
         )
 
@@ -920,6 +900,21 @@ class GreenContext:
         if device_id is None:
             raise RuntimeError("GreenContext has been destroyed")
         return device_id
+
+    @property
+    def sm_partition(self) -> SMPartition:
+        r"""The context's actual SM resource, which can be subdivided.
+
+        The returned resource keeps this context alive while it is in use.
+        """
+        self._ensure_alive()
+        resource = _check_cuda_bindings(
+            _drv.cuGreenCtxGetDevResource(  # pyrefly: ignore [missing-attribute]
+                self._green_ctx,
+                _drv.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,  # pyrefly: ignore [missing-attribute]
+            )
+        )
+        return SMPartition(resource, self.device_id, self)
 
     @property
     def sm_count(self) -> int:
