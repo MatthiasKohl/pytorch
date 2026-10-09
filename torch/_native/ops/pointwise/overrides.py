@@ -31,14 +31,13 @@ from .table import (
 # the registration metadata; a row's `fn` is a NAME resolved via ops.get_fn() at call
 # time. Bind the cutlass-laden modules as lazy proxies so their imports fire then.
 if TYPE_CHECKING:
-    from ...cutedsl import dtypes as dt
-    from .._cutedsl import launch as _L
+    from ...cutedsl import dtypes as dt, launch as _L
     from . import kernel as K, ops
 else:
     # dtypes imports cutlass at module scope and THIS module is imported at registration time, so
     # binding it eagerly would pull the DSL runtime into `import torch`.
     dt = LazyModule("torch._native.cutedsl.dtypes")
-    _L = LazyModule("torch._native.ops._cutedsl.launch")
+    _L = LazyModule("torch._native.cutedsl.launch")
     K = LazyModule("torch._native.ops.pointwise.kernel")
     ops = LazyModule("torch._native.ops.pointwise.ops")
 
@@ -80,9 +79,7 @@ def _layouts_serveable(ins) -> bool:
 
 
 def _is_wrapped_scalar(t) -> bool:
-    # A 0-d CPU tensor standing in for a python number, as produced by the registry's
-    # _scalar_arg_coercer for `x * 2.0`. Its dtype is already aten's weak-promotion
-    # result, so it needs no dtype fixup -- only a device transfer.
+    # Coerced Python numbers retain weak promotion and launch as runtime constants.
     return isinstance(t, torch.Tensor) and t.dim() == 0 and t.device.type == "cpu"
 
 
@@ -93,15 +90,6 @@ def _device_ref(ins):
     # remainder.Scalar_Tensor, xlogy.Scalar_Self, bitwise_*.Scalar_Tensor), so slot 0 is
     # not a safe device reference.
     return next((t for t in ins if not _is_wrapped_scalar(t)), None)
-
-
-def _localize_scalars(ins):
-    # Move coerced-number operands onto the tensor operands' device. Cheap (a 4/8-byte
-    # H2D of a 0-d tensor) and done once per call, before the kernel wraps operands.
-    ref = _device_ref(ins)
-    if ref is None:
-        return ins
-    return tuple(t.to(ref.device) if _is_wrapped_scalar(t) else t for t in ins)
 
 
 def _supported(t, dtypes) -> bool:
@@ -260,7 +248,9 @@ def _make_cond(row: PointwiseDef, variant):
 
     def cond(*args, **kwargs):
         ins = args[: row.nin]
-        if len(ins) < row.nin or not all(_supported(t, dtypes) for t in ins):
+        if len(ins) < row.nin or not all(
+            _supported(t, dtypes) for t in ins
+        ):
             return False
         # The DEVICE reference must be a real device operand, not simply operand 0. aten
         # puts the coerced scalar FIRST for the reflected overloads -- rsub.Scalar is
@@ -284,19 +274,17 @@ def _make_cond(row: PointwiseDef, variant):
             if row.mode_int_only and _mode_of(row, args, kwargs) in row.mode_int_only:
                 if any(t.dtype.is_floating_point for t in ins):
                     return False
-        # A 0-d CPU operand is aten's coerced python number (registry's
-        # _scalar_arg_coercer wraps x*2.0's 2.0 at the weak-promotion dtype); the impl
-        # moves it onto the device. A dim>0 CPU tensor is a genuine cross-device call
-        # and still declines.
+        # A 0-d CPU operand retains weak promotion and launches as a runtime constant.
+        # A dim>0 CPU tensor is a cross-device call and still declines.
         if any(t.device != ref.device and not _is_wrapped_scalar(t) for t in ins):
             return False
-        if not _layouts_serveable(ins):
-            return False  # gapped operand set the rowvec path can't serve -> aten
         try:
             bshape = torch.broadcast_shapes(*(t.shape for t in ins))
         except RuntimeError:
             return False  # incompatible -> aten raises the precise size-mismatch error
         tgt = _out_tensor(variant, row, args, kwargs)
+        if not _layouts_serveable(ins):
+            return False
         # The row's own aten meta precondition (a shared-dtype requirement rather than
         # promotion -- heaviside, lerp.Tensor). False means aten RAISES, so decline and
         # let it produce the message; serving would return a value instead of an error.
@@ -440,7 +428,7 @@ def _make_impl(row: PointwiseDef, variant):
         return [args[0]]  # self
 
     def impl(*args, **kwargs):
-        ins = _localize_scalars(args[: row.nin])
+        ins = args[: row.nin]
         # (dtype, is-0-dim) per operand: the promotion tier, and part of the kernel key.
         in_dtypes = _promo_key(ins)
         # Mode rows pick their fn (and possibly promotion) from a string kwarg; the

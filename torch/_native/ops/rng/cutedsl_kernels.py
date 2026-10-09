@@ -12,7 +12,10 @@ seed/offset arrive as Int64 scalars) and capture (DevState: seed/offset are load
 generator's extragraph tensors at run time, so replays see what replay_prologue wrote).
 """
 
+from typing import Any
+
 import cuda.bindings.driver as cuda
+
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32, Uint64
@@ -72,7 +75,9 @@ def _uniform(x: Uint32) -> Float32:
 class _Distribution:
     # kind: "uniform" -> a*u + b (uniform_ / rand); "normal" -> box-muller then mean+std*z
     # (normal_ / randn). unroll is aten's unroll_factor (4 for fp32).
-    def __init__(self, kind: str, is_capture: bool, iter_unroll: int, unroll: int = 4):
+    def __init__(
+        self, kind: str, is_capture: bool, iter_unroll: int, unroll: int = 4
+    ) -> None:
         self.kind = kind
         self.is_capture = is_capture
         # iter_unroll: grid-stride iterations emitted as a compile-time block (the knob;
@@ -96,7 +101,7 @@ class _Distribution:
         num_iters: Int32,
         grid_x: Int32,
         stream: cuda.CUstream,
-    ):
+    ) -> None:
         self.kernel(
             mOut, mSeed, mOff, seed_val, off_val, intra, argA, argB, argC, num_iters
         ).launch(grid=[grid_x, 1, 1], block=[_BLOCK, 1, 1], stream=stream)
@@ -114,7 +119,7 @@ class _Distribution:
         argB: Float32,
         argC: Float32,
         num_iters: Int32,
-    ):
+    ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
@@ -179,12 +184,12 @@ class _Distribution:
     def _one_iter(
         self,
         mOut: cute.Tensor,
-        n,
+        n: Any,
         idx: Int64,
         tpg: Int64,
         stride: Int64,
         off4: Int64,
-        it,
+        it: Int32,
         c2: Uint32,
         c3: Uint32,
         k0: Uint32,
@@ -192,7 +197,7 @@ class _Distribution:
         argA: Float32,
         argB: Float32,
         argC: Float32,
-    ):
+    ) -> None:
         # ONE grid-stride iteration: one curand4 draw -> `unroll` strided elements. Shared
         # by the unrolled main body and the epilogue so there is a single implementation of
         # the counter mapping and the transforms.
@@ -244,7 +249,9 @@ class _Distribution:
             mOut[base + 3 * tpg] = mOut.element_type(v3)
 
 
-def _log_key(kind, dtype, is_capture, iter_unroll):
+def _log_key(
+    kind: str, dtype: type[cutlass.Numeric], is_capture: bool, iter_unroll: int
+) -> str:
     return f"{kind} dtype={dtype} capture={is_capture} iter_unroll={iter_unroll}"
 
 
@@ -255,7 +262,9 @@ def _log_key(kind, dtype, is_capture, iter_unroll):
 # i.e. a 256M-element randn paid ~15s of nvrtc). A dynamic loop compiles once and serves
 # every size.
 @instrumented_cutedsl_cache("aten::distribution", key_fn=_log_key)
-def _compile(kind: str, dtype, is_capture: bool, iter_unroll: int):
+def _compile(
+    kind: str, dtype: type[cutlass.Numeric], is_capture: bool, iter_unroll: int
+) -> Any:
     out_fake = cute.runtime.make_fake_tensor(
         dtype, (cute.sym_int(divisibility=1),), stride=(1,), assumed_align=16
     )

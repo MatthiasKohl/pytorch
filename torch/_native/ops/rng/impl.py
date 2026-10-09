@@ -15,6 +15,8 @@ sizes (see test_rng_dsl.py). That matters beyond this call -- a wrong reservatio
 desync every subsequent random op even if this one's values looked fine.
 """
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from ... import cutedsl_utils as cu
@@ -22,7 +24,7 @@ from ...utils import capability as cap
 from ...utils.lazy import LazyModule
 
 
-if False:  # TYPE_CHECKING-style guard without the import cost
+if TYPE_CHECKING:
     from . import cutedsl_kernels as CK
 else:
     CK = LazyModule("torch._native.ops.rng.cutedsl_kernels")
@@ -39,7 +41,7 @@ _DTYPES = (torch.float32,)
 _ARCH_MAJORS = (9, 10)
 
 
-def _serveable(self) -> bool:
+def _serveable(self: torch.Tensor) -> bool:
     # A default generator only: an explicit `generator=` argument means a non-default
     # engine whose state we are not reserving from, so decline it to aten.
     return (
@@ -55,13 +57,25 @@ def _serveable(self) -> bool:
     )
 
 
-def _uniform_cond(self, from_=0.0, to=1.0, *, generator=None):
+def _uniform_cond(
+    self: torch.Tensor,
+    from_: float = 0.0,
+    to: float = 1.0,
+    *,
+    generator: torch.Generator | None = None,
+) -> bool:
     if generator is not None:
         return False
     return _serveable(self)
 
 
-def _uniform_impl(self, from_=0.0, to=1.0, *, generator=None):
+def _uniform_impl(
+    self: torch.Tensor,
+    from_: float = 0.0,
+    to: float = 1.0,
+    *,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
     # aten: value = rand * (to - from) + from in opmath_t, then the (0,1] -> [0,1) bound
     # reversal that maps an exact `to` back to `from` (pytorch#16706) -- the kernel needs
     # `to` itself for that comparison, hence the third argument.
@@ -70,7 +84,13 @@ def _uniform_impl(self, from_=0.0, to=1.0, *, generator=None):
     )
 
 
-def _normal_cond(self, mean=0.0, std=1.0, *, generator=None):
+def _normal_cond(
+    self: torch.Tensor,
+    mean: float = 0.0,
+    std: float = 1.0,
+    *,
+    generator: torch.Generator | None = None,
+) -> bool:
     if generator is not None:
         return False
     if std < 0.0:
@@ -78,7 +98,13 @@ def _normal_cond(self, mean=0.0, std=1.0, *, generator=None):
     return _serveable(self)
 
 
-def _normal_impl(self, mean=0.0, std=1.0, *, generator=None):
+def _normal_impl(
+    self: torch.Tensor,
+    mean: float = 0.0,
+    std: float = 1.0,
+    *,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
     # aten: value = z * std + mean, z from curand_normal4's box-muller.
     return CK.fill_random(self, "normal", float(std), float(mean))
 

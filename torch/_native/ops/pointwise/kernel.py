@@ -25,7 +25,8 @@
 # Addressing is canonical CuTe in both paths -- no hand-rolled offset math.
 
 import math
-from typing import NamedTuple
+from collections.abc import Sequence
+from typing import Any, NamedTuple
 
 import cuda.bindings.driver as cuda
 
@@ -36,9 +37,9 @@ from cutlass.cute.nvgpu import cpasync
 
 import torch
 
+from ...cutedsl import hw_caps as _hw, launch as _L
 from ...cutedsl.dtypes import torch2cute
-from .._cutedsl import hw_caps as _hw, launch as _L
-from .._cutedsl.plan_cache import cached_plan
+from ...cutedsl.plan_cache import cached_plan
 
 
 # Exposed perf knobs (autotunable). run() fills any knob left None from _choose_config
@@ -82,6 +83,30 @@ _PLAN = {}  # key -> _Plan (compiled kernel + shape-invariant launch decisions)
 # carries no shape (dynamic nvec) and no path's key carries scalar values (runtime
 # args), so kernel count is O(op x dtype-combo x knobs), not O(call diversity).
 _KERNELS = {}
+_SCALAR_FUNCTIONS: dict[tuple, Any] = {}
+
+
+class _ScalarOperands:
+    def __init__(self, fn: Any, scalar_mask: tuple[bool, ...]) -> None:
+        self.fn = fn
+        self.scalar_mask = scalar_mask
+        self.nargs = len(scalar_mask)
+        self.nscalars = sum(scalar_mask)
+        self.ninputs = self.nargs - self.nscalars
+        self.tensor_indices = tuple(
+            sum(not v for v in scalar_mask[:i]) for i in range(self.nargs)
+        )
+        self.scalar_indices = tuple(sum(scalar_mask[:i]) for i in range(self.nargs))
+
+    @cute.jit
+    def __call__(self, *args: Any) -> Any:
+        values = []
+        for i in cutlass.range_constexpr(self.nargs):
+            if const_expr(self.scalar_mask[i]):
+                values.append(args[self.ninputs + self.scalar_indices[i]])
+            else:
+                values.append(args[self.tensor_indices[i]])
+        return self.fn(*values, *args[self.ninputs + self.nscalars :])
 
 
 class _PointwiseConfig(NamedTuple):
@@ -118,7 +143,7 @@ def _choose_config(numel: int, compute_bits: int, hw=None, nin=1) -> "_Pointwise
     # at-scale) move with the shape; both thresholds scale by hw.fill_scale so a larger
     # GPU coarsens at a proportionally larger numel and a smaller one sooner (fill_scale
     # is 1.0 on B200 -> the anchor numbers reproduce exactly).
-    fill = 1.0 if hw is None else hw.fill_scale
+    fill = 1.0 if hw is None else hw.sm_count * hw.max_threads_per_sm / (148 * 2048)
     norm = numel // max(compute_bits // 16, 1)  # dtype-normalized element count
     ept = next(e for thresh, e in _EPT_SCHEDULE if norm >= thresh * fill)
     # The 256b widening was measured on ops that READ memory, where the extra width buys
@@ -163,6 +188,7 @@ class _ElementwiseVec:
         load,
         pipe_depth,
         in_dtype,
+        index_type=cutlass.Int32,
     ):
         self.fn = fn
         self.nin = nin
@@ -179,10 +205,11 @@ class _ElementwiseVec:
         # smem allocations: under TMA mIns[k].element_type is a descriptor union, not
         # a plain Numeric, so we can't read it off the wrapped tensor there.
         self.in_dtype = in_dtype
+        self.index_type = index_type
 
     @cute.jit
     def __call__(self, mIns: list, mOuts: list, consts: list, stream: cuda.CUstream):
-        nvec = mOuts[0].shape[0]
+        nvec = self.index_type(mOuts[0].shape[0])
         tile = const_expr(self.block * self.ept)  # vec-rows retired per block
         # tile-mode TMA atoms (host-compile-time, inside the jit region), one per
         # input; only the tma load path uses them. ept==1 for tma (host guard), so the
@@ -229,13 +256,11 @@ class _ElementwiseVec:
             cute.autovec_copy(outs[j], mOuts[j][i, None])
 
     @cute.kernel
-    def kernel(
-        self, mIns: list, mOuts: list, consts: list, nvec: cutlass.Int32, tma_atoms
-    ):
+    def kernel(self, mIns: list, mOuts: list, consts: list, nvec, tma_atoms):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         block = const_expr(self.block)
-        base = bidx * const_expr(block * self.ept) + tidx
+        base = self.index_type(bidx) * const_expr(block * self.ept) + tidx
         if const_expr(self.load == "direct"):
             # gmem->rmem inline, per-thread block-strided ept-unrolled loop.
             for p in cutlass.range_constexpr(self.ept):
@@ -388,7 +413,17 @@ class _ElementwiseStrided:
     # on this path because the vec/rowvec routes hand the fn a vector fragment rather
     # than one element, so there is no single index to give it.
     def __init__(
-        self, fn, nin, nout, nconsts, compute, out_types, block, ept, with_index=False
+        self,
+        fn,
+        nin,
+        nout,
+        nconsts,
+        compute,
+        out_types,
+        block,
+        ept,
+        with_index=False,
+        index_type=cutlass.Int32,
     ):
         self.fn = fn
         self.nin = nin
@@ -399,10 +434,11 @@ class _ElementwiseStrided:
         self.block = block
         self.ept = ept
         self.with_index = with_index
+        self.index_type = index_type
 
     @cute.jit
     def __call__(self, mIns: list, mOuts: list, consts: list, stream: cuda.CUstream):
-        n = cute.size(mOuts[0])
+        n = self.index_type(cute.size(mOuts[0]))
         tile = const_expr(self.block * self.ept)
         self.kernel(mIns, mOuts, consts, n).launch(
             grid=[cute.ceil_div(n, tile), 1, 1],
@@ -411,11 +447,11 @@ class _ElementwiseStrided:
         )
 
     @cute.kernel
-    def kernel(self, mIns: list, mOuts: list, consts: list, n: cutlass.Int32):
+    def kernel(self, mIns: list, mOuts: list, consts: list, n):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         block = const_expr(self.block)
-        base = bidx * const_expr(block * self.ept) + tidx
+        base = self.index_type(bidx) * const_expr(block * self.ept) + tidx
         for p in cutlass.range_constexpr(self.ept):
             i = base + p * block
             if i < n:
@@ -443,7 +479,19 @@ class _ElementwiseRowVec:
     # V-fragment: the within-row V load is a contiguous 128-bit vector (coalesced), only
     # the row base is gapped -- the density aten's scalar offset path ignores (~2x aten).
     # Reuses _ElementwiseVec._compute_store's per-element fn+cast+store over the V lane.
-    def __init__(self, fn, nin, nout, nconsts, compute, out_types, V, ncv, block):
+    def __init__(
+        self,
+        fn,
+        nin,
+        nout,
+        nconsts,
+        compute,
+        out_types,
+        V,
+        ncv,
+        block,
+        index_type=cutlass.Int32,
+    ):
         self.fn = fn
         self.nin = nin
         self.nout = nout
@@ -453,11 +501,12 @@ class _ElementwiseRowVec:
         self.V = V
         self.ncv = ncv  # vec-chunks per row (run // V)
         self.block = block
+        self.index_type = index_type
 
     @cute.jit
     def __call__(self, mIns: list, mOuts: list, consts: list, stream: cuda.CUstream):
         rows = mOuts[0].shape[0]
-        nvec = rows * const_expr(self.ncv)  # total (row, chunk) fragments
+        nvec = self.index_type(rows) * const_expr(self.ncv)
         self.kernel(mIns, mOuts, consts, nvec).launch(
             grid=[cute.ceil_div(nvec, self.block), 1, 1],
             block=[self.block, 1, 1],
@@ -465,10 +514,10 @@ class _ElementwiseRowVec:
         )
 
     @cute.kernel
-    def kernel(self, mIns: list, mOuts: list, consts: list, nvec: cutlass.Int32):
+    def kernel(self, mIns: list, mOuts: list, consts: list, nvec):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        i = bidx * const_expr(self.block) + tidx
+        i = self.index_type(bidx) * const_expr(self.block) + tidx
         ncv = const_expr(self.ncv)
         V = const_expr(self.V)
         if i < nvec:
@@ -600,11 +649,13 @@ def _view_vec(t, V):
     return t.reshape(-1, V)
 
 
-def _fake_vec(t, V, dyn):
+def _fake_vec(t, V, dyn, index_type=cutlass.Int32):
     # 16-byte alignment: torch allocations are >=256 B aligned and V*itemsize == 128 bits, so the
     # wide load is safe. `dyn` leaves the vector COUNT symbolic, so one kernel serves every numel.
-    lead = _L.sym() if dyn else t.numel() // V
-    return _L.fake_compact(torch2cute[t.dtype], (lead, V), order=(1, 0), align=16)
+    lead = cute.sym_int(width=index_type.width) if dyn else t.numel() // V
+    return _L.fake_compact(
+        torch2cute[t.dtype], (lead, V), stride_order=(1, 0), align=16
+    )
 
 
 def _view_rowvec(t, rows, run, row_step, V):
@@ -616,18 +667,20 @@ def _view_rowvec(t, rows, run, row_step, V):
 def _fake_rowvec(t, rows, run, row_step, V):
     # Extents and pitch are STATIC here: the plan key carries (rows, run, row_step), so a different
     # gap geometry is a different kernel either way.
-    return _L.fake_strided(
+    return cute.runtime.make_fake_tensor(
         torch2cute[t.dtype],
         (rows, run // V, V),
-        (row_step, V, 1),
-        align=16,
+        stride=(row_step, V, 1),
+        assumed_align=16,
     )
 
 
 def _fake_strided(t, shape):
     # The catch-all route BAKES each operand's layout, which is why the key carries them.
     v = t.expand(shape)
-    return _L.fake_strided(torch2cute[t.dtype], tuple(v.shape), v.stride())
+    return cute.runtime.make_fake_tensor(
+        torch2cute[t.dtype], tuple(v.shape), stride=v.stride()
+    )
 
 
 def _rowvec_ok(inputs, shape, out_dtypes, compute_torch, V):
@@ -662,6 +715,25 @@ class _Plan(NamedTuple):
     out_dtypes: tuple  # per-output torch dtype (its length is the output count)
     fn: object  # the compiled kernel
     rowgap: tuple = ()  # (rows, run, row_step) for the rowvec path; () otherwise
+
+
+def _index_type(
+    tensors: Sequence[torch.Tensor],
+    shape: Sequence[int],
+    tile: int,
+) -> type[cutlass.Numeric]:
+    limit = torch.iinfo(torch.int32).max
+    numel = math.prod(shape)
+    if ((numel + tile - 1) // tile) * tile > limit:
+        return cutlass.Int64
+    for tensor in tensors:
+        offset = sum(
+            (size - 1) * abs(stride)
+            for size, stride in zip(tensor.shape, tensor.stride())
+        )
+        if offset > limit:
+            return cutlass.Int64
+    return cutlass.Int32
 
 
 def _build_plan(
@@ -763,6 +835,9 @@ def _build_plan(
     # fn a whole V-wide fragment, not one element, so there is no single index to pass), so
     # skip the vec/rowvec tests entirely and let the else-branch below take it.
     vec1 = not with_index and _vec_ok(inputs, shape, out_dtypes, compute_torch, V, ref)
+    index_type = _index_type(
+        (*inputs, *seed_outs), shape, block * ept * (V if vec1 else 1)
+    )
     if vec1 and load != "tma":
         # tma is excluded from the dynamic wrap: make_tiled_tma_atom builds a
         # descriptor from the (static) tile extents; the rare tma plan falls to the
@@ -780,11 +855,12 @@ def _build_plan(
             load,
             pipe_depth,
             torch2cute[ref.dtype],
+            index_type,
         )
-        cin = [_fake_vec(t, V, True) for t in inputs]
-        cout = [_fake_vec(o, V, True) for o in seed_outs]
+        cin = [_fake_vec(t, V, True, index_type) for t in inputs]
+        cout = [_fake_vec(o, V, True, index_type) for o in seed_outs]
         path = "vec"
-        kkey = common + ("vec", V, block, ept, load, pipe_depth)
+        kkey = common + ("vec", V, block, ept, load, pipe_depth, index_type)
     elif vec1:
         op = _ElementwiseVec(
             fn,
@@ -799,11 +875,21 @@ def _build_plan(
             load,
             pipe_depth,
             torch2cute[ref.dtype],
+            index_type,
         )
         cin = [_fake_vec(t, V, False) for t in inputs]
         cout = [_fake_vec(o, V, False) for o in seed_outs]
         path = "vec_static"
-        kkey = common + ("vec_static", shape, V, block, ept, load, pipe_depth)
+        kkey = common + (
+            "vec_static",
+            shape,
+            V,
+            block,
+            ept,
+            load,
+            pipe_depth,
+            index_type,
+        )
     elif (
         not with_index
         and (rg := _rowvec_ok(inputs, shape, out_dtypes, compute_torch, V)) is not None
@@ -812,15 +898,33 @@ def _build_plan(
         # output is dense, so its run == its full row-length; only inputs carry the gap.
         rows, run, row_step = rg
         op = _ElementwiseRowVec(
-            fn, nin, nout, len(consts), compute, out_types, V, run // V, block
+            fn,
+            nin,
+            nout,
+            len(consts),
+            compute,
+            out_types,
+            V,
+            run // V,
+            block,
+            index_type,
         )
         cin = [_fake_rowvec(t, rows, run, row_step, V) for t in inputs]
         cout = [_fake_rowvec(o, rows, run, run, V) for o in seed_outs]
         path, rowgap = "rowvec", rg
-        kkey = common + ("rowvec", rg, V, block)
+        kkey = common + ("rowvec", rg, V, block, index_type)
     else:
         op = _ElementwiseStrided(
-            fn, nin, nout, len(consts), compute, out_types, block, ept, with_index
+            fn,
+            nin,
+            nout,
+            len(consts),
+            compute,
+            out_types,
+            block,
+            ept,
+            with_index,
+            index_type,
         )
         cin = [_fake_strided(t, shape) for t in inputs]
         cout = [_fake_strided(o, tuple(o.shape)) for o in seed_outs]
@@ -832,7 +936,7 @@ def _build_plan(
         # gets handed a differently-strided one and from_dlpack rejects it at launch.
         lays = tuple((tuple(t.shape), t.stride()) for t in inputs)
         out_lays = tuple((tuple(o.shape), o.stride()) for o in seed_outs)
-        kkey = common + ("strided", shape, lays, out_lays, block, ept)
+        kkey = common + ("strided", shape, lays, out_lays, block, ept, index_type)
     # Compile against PLACEHOLDER scalar values, not the live ones. The scalars are
     # genuine runtime arguments (they arrive as %arg f32/i32 in the IR), but the DSL
     # mangles every non-IR argument's VALUE into the generated MLIR symbol name, so
@@ -879,6 +983,21 @@ def run(
     # given, the kernel writes into these instead of allocating (the caller guarantees
     # they are the broadcast shape, right dtype, and contiguous; the override cond gates
     # that). None -> allocate fresh outputs (the functional path).
+    scalar_mask = tuple(t.device.type == "cpu" and t.dim() == 0 for t in inputs)
+    if any(scalar_mask):
+        scalar_key = (id(fn), scalar_mask)
+        scalar_fn = _SCALAR_FUNCTIONS.get(scalar_key)
+        if scalar_fn is None:
+            scalar_fn = _ScalarOperands(fn, scalar_mask)
+            _SCALAR_FUNCTIONS[scalar_key] = scalar_fn
+        fn = scalar_fn
+        scalar_consts = tuple(
+            compute(t.item()) for t, scalar in zip(inputs, scalar_mask) if scalar
+        )
+        consts = scalar_consts + tuple(consts)
+        inputs = tuple(t for t, scalar in zip(inputs, scalar_mask) if not scalar)
+        nin = len(inputs)
+        key = (*key, scalar_mask)
     plan = cached_plan(
         _PLAN,
         key,
@@ -923,7 +1042,9 @@ def run(
         cout = [_view_vec(o, plan.V) for o in outs]
     elif plan.path == "rowvec":
         rows, run, row_step = plan.rowgap
-        cin = [_L.read_only(_view_rowvec(t, rows, run, row_step, plan.V)) for t in inputs]
+        cin = [
+            _L.read_only(_view_rowvec(t, rows, run, row_step, plan.V)) for t in inputs
+        ]
         # outputs are contiguous (row_step == run), whether freshly allocated or a
         # caller-provided .out/in-place tensor the cond verified dense.
         cout = [_view_rowvec(o, rows, run, run, plan.V) for o in outs]

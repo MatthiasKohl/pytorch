@@ -3,14 +3,9 @@
 # this module imports cutlass.
 
 import cutlass
-from cutlass import Float32, Float64, Int32
+from cutlass import Float32, Float64, Int32, Int64
 
 import torch
-
-
-# The cute scalar types are re-exported: a caller that reads an element type off this table usually
-# needs to BUILD one too (a boxed Int64 index next to a float compute type), and importing cutlass
-# separately for that would put a second DSL import on the caller's path.
 
 
 # torch dtype -> cute numeric type. Extend as new dtypes are supported.
@@ -19,7 +14,15 @@ torch2cute = {
     torch.float64: Float64,
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
+    torch.bool: cutlass.Boolean,
     torch.int32: Int32,
+    torch.int64: Int64,
+    torch.int8: cutlass.Int8,
+    torch.int16: cutlass.Int16,
+    torch.uint8: cutlass.Uint8,
+    torch.uint16: cutlass.Uint16,
+    torch.uint32: cutlass.Uint32,
+    torch.uint64: cutlass.Uint64,
 }
 
 # Inverse mapping for allocating torch scratch from a trait's cute accumulator dtype.
