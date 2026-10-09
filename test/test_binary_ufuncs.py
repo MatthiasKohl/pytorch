@@ -573,6 +573,51 @@ class TestBinaryUfuncsDevice(TestCase):
             actual = op(lhs_non_contig, rhs_non_contig)
             self.assertEqual(expected, actual)
 
+    @onlyOn("cuda")
+    @dtypes(torch.uint8, torch.bfloat16, torch.float32, torch.float64)
+    @parametrize("start", (0, 512))
+    def test_contiguous_inner_slices(
+        self, device: str, dtype: torch.dtype, start: int
+    ) -> None:
+        def make_input() -> torch.Tensor:
+            if dtype is torch.uint8:
+                return torch.randint(0, 64, (128, 2048), device=device, dtype=dtype)
+            return torch.randn((128, 2048), device=device, dtype=dtype)
+
+        with torch.backends.python_native.cutedsl.disabled():
+            lhs = make_input()[:, start : start + 512]
+            rhs = make_input()[:, start : start + 512]
+            rhs_contig = rhs.contiguous()
+
+            self.assertFalse(lhs.is_contiguous())
+            self.assertFalse(rhs.is_contiguous())
+
+            expected = lhs.contiguous() + rhs_contig
+            self.assertEqual(lhs + rhs, expected)
+            self.assertEqual(lhs + rhs_contig, expected)
+            self.assertEqual(torch.abs(lhs), torch.abs(lhs.contiguous()))
+
+            out = torch.empty((128, 2048), device=device, dtype=dtype)[
+                :, start : start + 512
+            ]
+            torch.add(lhs, rhs_contig, out=out)
+            self.assertEqual(out, expected)
+
+            mask = torch.empty(lhs.shape, device=device, dtype=torch.bool)
+            expected_mask = lhs.contiguous() > rhs_contig
+            torch.gt(lhs, rhs_contig, out=mask)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                torch.add(lhs, rhs_contig, out=out)
+                torch.gt(lhs, rhs_contig, out=mask)
+            graph.replay()
+            self.assertEqual(out, expected)
+            self.assertEqual(mask, expected_mask)
+
+            stepped = make_input()[:, ::4]
+            self.assertFalse(stepped.is_contiguous())
+            self.assertEqual(stepped + stepped, stepped.contiguous() * 2)
+
     @ops(binary_ufuncs)
     def test_non_contig_index(self, device, dtype, op):
         shape = (2, 2, 1, 2)

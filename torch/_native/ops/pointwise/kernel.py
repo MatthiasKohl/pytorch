@@ -983,6 +983,14 @@ def run(
     # given, the kernel writes into these instead of allocating (the caller guarantees
     # they are the broadcast shape, right dtype, and contiguous; the override cond gates
     # that). None -> allocate fresh outputs (the functional path).
+    if out is not None and nout == 1 and not with_index:
+        from . import tuned
+
+        knobs = (block, ept, vec_bits, load, pipe_depth)
+        if all(value is None for value in knobs) and tuned.try_run(
+            fn, key, inputs, out[0], consts, compute
+        ):
+            return tuple(out)
     scalar_mask = tuple(t.device.type == "cpu" and t.dim() == 0 for t in inputs)
     if any(scalar_mask):
         scalar_key = (id(fn), scalar_mask)

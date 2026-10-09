@@ -32,7 +32,7 @@ from .table import (
 # time. Bind the cutlass-laden modules as lazy proxies so their imports fire then.
 if TYPE_CHECKING:
     from ...cutedsl import dtypes as dt, launch as _L
-    from . import kernel as K, ops
+    from . import kernel as K, ops, tuned
 else:
     # dtypes imports cutlass at module scope and THIS module is imported at registration time, so
     # binding it eagerly would pull the DSL runtime into `import torch`.
@@ -40,6 +40,7 @@ else:
     _L = LazyModule("torch._native.cutedsl.launch")
     K = LazyModule("torch._native.ops.pointwise.kernel")
     ops = LazyModule("torch._native.ops.pointwise.ops")
+    tuned = LazyModule("torch._native.ops.pointwise.tuned")
 
 
 # Compute-capability majors this family's kernels have been run on: Hopper and Blackwell.
@@ -92,7 +93,7 @@ def _device_ref(ins):
     return next((t for t in ins if not _is_wrapped_scalar(t)), None)
 
 
-def _supported(t, dtypes) -> bool:
+def _supported(t, dtypes, allow_tma=False) -> bool:
     # COW is not gated: inputs export read-only (launch._ro / ReadOnlyTensorWrapper),
     # so a COW input flows through the kernel without materializing.
     #
@@ -105,7 +106,7 @@ def _supported(t, dtypes) -> bool:
     return (
         isinstance(t, torch.Tensor)
         and t.dtype in dtypes
-        and _layout_ok(t)
+        and (allow_tma or _layout_ok(t))
         and t.numel() > 0
         and not t.is_neg()
         and not t.is_conj()
@@ -249,7 +250,7 @@ def _make_cond(row: PointwiseDef, variant):
     def cond(*args, **kwargs):
         ins = args[: row.nin]
         if len(ins) < row.nin or not all(
-            _supported(t, dtypes) for t in ins
+            _supported(t, dtypes, allow_tma=True) for t in ins
         ):
             return False
         # The DEVICE reference must be a real device operand, not simply operand 0. aten
@@ -284,7 +285,12 @@ def _make_cond(row: PointwiseDef, variant):
             return False  # incompatible -> aten raises the precise size-mismatch error
         tgt = _out_tensor(variant, row, args, kwargs)
         if not _layouts_serveable(ins):
-            return False
+            _, result_dtype = _result_dtypes(row, _promo_key(ins), promotion)
+            out_dtype = tgt.dtype if isinstance(tgt, torch.Tensor) else result_dtype
+            if row.nout != 1 or not tuned.can_run(
+                ins, bshape, out_dtype, tgt, allow_tma=variant.out_from != "self"
+            ):
+                return False
         # The row's own aten meta precondition (a shared-dtype requirement rather than
         # promotion -- heaviside, lerp.Tensor). False means aten RAISES, so decline and
         # let it produce the message; serving would return a value instead of an error.
