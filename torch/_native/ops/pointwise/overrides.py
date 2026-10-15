@@ -14,7 +14,6 @@ from torch._prims_common import elementwise_dtypes
 from ... import cutedsl_utils as cu
 from ...utils import capability as cap
 from ...utils.lazy import LazyModule
-from .indexing import can_use_32bit_index_math
 from .table import (
     _INT_DTYPES,
     POINTWISE_DEF_TABLE,
@@ -33,7 +32,7 @@ from .table import (
 # time. Bind the cutlass-laden modules as lazy proxies so their imports fire then.
 if TYPE_CHECKING:
     from ...cutedsl import dtypes as dt, launch as _L
-    from . import kernel as K, ops
+    from . import kernel as K, ops, tuned
 else:
     # dtypes imports cutlass at module scope and THIS module is imported at registration time, so
     # binding it eagerly would pull the DSL runtime into `import torch`.
@@ -41,13 +40,13 @@ else:
     _L = LazyModule("torch._native.cutedsl.launch")
     K = LazyModule("torch._native.ops.pointwise.kernel")
     ops = LazyModule("torch._native.ops.pointwise.ops")
+    tuned = LazyModule("torch._native.ops.pointwise.tuned")
 
 
 # Compute-capability majors this family's kernels have been run on: Hopper and Blackwell.
 _ARCH_MAJORS = (9, 10)
 
 _SUPPORTED = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
-_KERNEL_DTYPES = _SUPPORTED + (torch.int32,)
 
 
 def _layout_ok(t) -> bool:
@@ -73,17 +72,15 @@ def _layouts_serveable(ins) -> bool:
     gaps = {K._row_gap_view(t) for t in ins if not t.is_contiguous()}
     if not gaps:
         return True  # all contiguous
-    if None in gaps or len(gaps) > 1:
-        return False  # unsupported or mixed gap geometries -> decline
+    if len(gaps) > 1:
+        return False  # two different gap geometries -> strided-slow -> decline
     # One gap geometry: every operand must share it (a contiguous operand of the same
     # shape has a DIFFERENT (row_step == run) geometry -> mixed -> strided -> decline).
     return all(K._row_gap_view(t) in gaps for t in ins)
 
 
 def _is_wrapped_scalar(t) -> bool:
-    # A 0-d CPU tensor standing in for a python number, as produced by the registry's
-    # _scalar_arg_coercer for `x * 2.0`. Its dtype is already aten's weak-promotion
-    # result, so it needs no dtype fixup -- only a device transfer.
+    # Coerced Python numbers retain weak promotion and launch as runtime constants.
     return isinstance(t, torch.Tensor) and t.dim() == 0 and t.device.type == "cpu"
 
 
@@ -94,15 +91,6 @@ def _device_ref(ins):
     # remainder.Scalar_Tensor, xlogy.Scalar_Self, bitwise_*.Scalar_Tensor), so slot 0 is
     # not a safe device reference.
     return next((t for t in ins if not _is_wrapped_scalar(t)), None)
-
-
-def _localize_scalars(ins):
-    # Move coerced-number operands onto the tensor operands' device. Cheap (a 4/8-byte
-    # H2D of a 0-d tensor) and done once per call, before the kernel wraps operands.
-    ref = _device_ref(ins)
-    if ref is None:
-        return ins
-    return tuple(t.to(ref.device) if _is_wrapped_scalar(t) else t for t in ins)
 
 
 def _supported(t, dtypes, allow_tma=False) -> bool:
@@ -257,7 +245,7 @@ def _make_cond(row: PointwiseDef, variant):
     # the inexact-float rows (fmod/remainder/floor_divide) stay integer-only.
     base = _SUPPORTED if row.dtypes is None else row.dtypes
     ints = row.int_dtypes or (_INT_DTYPES if row.int_via_float else ())
-    dtypes = tuple(d for d in (*base, *ints) if d in _KERNEL_DTYPES)
+    dtypes = tuple(base) + tuple(ints)
 
     def cond(*args, **kwargs):
         ins = args[: row.nin]
@@ -287,10 +275,8 @@ def _make_cond(row: PointwiseDef, variant):
             if row.mode_int_only and _mode_of(row, args, kwargs) in row.mode_int_only:
                 if any(t.dtype.is_floating_point for t in ins):
                     return False
-        # A 0-d CPU operand is aten's coerced python number (registry's
-        # _scalar_arg_coercer wraps x*2.0's 2.0 at the weak-promotion dtype); the impl
-        # moves it onto the device. A dim>0 CPU tensor is a genuine cross-device call
-        # and still declines.
+        # A 0-d CPU operand retains weak promotion and launches as a runtime constant.
+        # A dim>0 CPU tensor is a cross-device call and still declines.
         if any(t.device != ref.device and not _is_wrapped_scalar(t) for t in ins):
             return False
         try:
@@ -298,19 +284,13 @@ def _make_cond(row: PointwiseDef, variant):
         except RuntimeError:
             return False  # incompatible -> aten raises the precise size-mismatch error
         tgt = _out_tensor(variant, row, args, kwargs)
-        tensors = (*ins, tgt) if isinstance(tgt, torch.Tensor) else ins
-        if not can_use_32bit_index_math(tensors, bshape):
-            return False
-        _, result_dtype = _result_dtypes(row, _promo_key(ins), promotion)
-        out_dtype = tgt.dtype if isinstance(tgt, torch.Tensor) else result_dtype
-        tuned_required = out_dtype == torch.bool or not _layouts_serveable(ins)
-        if tuned_required:
-            if row.nout != 1 or not K.can_run_tuned(
+        if not _layouts_serveable(ins):
+            _, result_dtype = _result_dtypes(row, _promo_key(ins), promotion)
+            out_dtype = tgt.dtype if isinstance(tgt, torch.Tensor) else result_dtype
+            if row.nout != 1 or not tuned.can_run(
                 ins, bshape, out_dtype, tgt, allow_tma=variant.out_from != "self"
             ):
                 return False
-        elif result_dtype not in _KERNEL_DTYPES:
-            return False
         # The row's own aten meta precondition (a shared-dtype requirement rather than
         # promotion -- heaviside, lerp.Tensor). False means aten RAISES, so decline and
         # let it produce the message; serving would return a value instead of an error.
@@ -340,7 +320,7 @@ def _make_cond(row: PointwiseDef, variant):
             # out=c128)` reached _build_plan and raised KeyError('torch.complex128').
             # (_CONV_SRC_DTYPES, not _CONV_DTYPES: bool is a legitimate .out target for
             # the comparison rows, which store a bool result.)
-            if tgt.dtype not in (*_CONV_SRC_DTYPES, torch.bool):
+            if tgt.dtype not in _CONV_SRC_DTYPES:
                 return False
             # Safe-cast gate: promotion result must fit the target dtype (else aten raises).
             _, result_dtype = _result_dtypes(row, _promo_key(ins), promotion)
@@ -454,7 +434,7 @@ def _make_impl(row: PointwiseDef, variant):
         return [args[0]]  # self
 
     def impl(*args, **kwargs):
-        ins = _localize_scalars(args[: row.nin])
+        ins = args[: row.nin]
         # (dtype, is-0-dim) per operand: the promotion tier, and part of the kernel key.
         in_dtypes = _promo_key(ins)
         # Mode rows pick their fn (and possibly promotion) from a string kwarg; the
@@ -511,8 +491,7 @@ _CONV_DTYPES = (
         torch.uint64,
     )
 )
-_CONV_DTYPES = tuple(d for d in _CONV_DTYPES if d in _KERNEL_DTYPES)
-_CONV_SRC_DTYPES = _CONV_DTYPES
+_CONV_SRC_DTYPES = _CONV_DTYPES + (torch.bool,)
 
 
 def _conv_serveable(src, dst_dtype):
@@ -523,8 +502,7 @@ def _conv_serveable(src, dst_dtype):
         return False
     return (
         _supported(src, _CONV_SRC_DTYPES)
-        and dst_dtype in _CONV_DTYPES
-        and can_use_32bit_index_math((src,), src.shape)
+        and dst_dtype in _CONV_DTYPES + (torch.bool,)
         and not (dst_dtype is torch.bool and src.dtype is torch.bool)
         and cap.device_ok(src, _ARCH_MAJORS)
         and cap.on_current_device(src)
@@ -672,9 +650,7 @@ def _copy_cond(self, src, non_blocking=False):
         bshape = torch.broadcast_shapes(self.shape, src.shape)
     except RuntimeError:
         return False
-    return tuple(bshape) == tuple(self.shape) and can_use_32bit_index_math(
-        (self, src), bshape
-    )
+    return tuple(bshape) == tuple(self.shape)
 
 
 def _copy_impl(self, src, non_blocking=False):
@@ -687,7 +663,7 @@ def _copy_impl(self, src, non_blocking=False):
 # the shape the constructors need: aten's full/zeros/ones are all
 # CompositeExplicitAugograd wrappers that lower to empty() + fill_(), so overriding fill_
 # serves the whole family without a row per constructor.
-_FILL_DTYPES = _KERNEL_DTYPES
+_FILL_DTYPES = _SUPPORTED + _INT_DTYPES
 
 
 def _fill_cond(self, value):
@@ -709,7 +685,6 @@ def _fill_cond(self, value):
         isinstance(self, torch.Tensor)
         and self.dtype in _FILL_DTYPES
         and self.numel() > 0
-        and can_use_32bit_index_math((self,), self.shape)
         and not self.is_neg()
         and not self.is_conj()
         and not cap.is_traced(self)
@@ -773,7 +748,7 @@ def _fill_impl(self, value):
 # (compute_arange_size's double-precision ceil, the resize + mismatch warning) runs in that
 # C++ wrapper before we are reached -- `out` arrives already correctly sized, so we
 # reproduce only the value kernel and never re-derive a length.
-_RANGE_DTYPES = _KERNEL_DTYPES
+_RANGE_DTYPES = _SUPPORTED + _INT_DTYPES
 
 
 def _range_out_serveable(out) -> bool:
@@ -781,7 +756,6 @@ def _range_out_serveable(out) -> bool:
         isinstance(out, torch.Tensor)
         and out.dtype in _RANGE_DTYPES
         and out.numel() > 0
-        and can_use_32bit_index_math((out,), out.shape)
         and not out.is_neg()
         and not out.is_conj()
         and not cap.is_traced(out)
@@ -882,9 +856,9 @@ def _linspace_out_impl(start, end, steps, *, out=None):
         key,
         0,
         1,
-        # halfway is an integer boundary within the admitted 32-bit range; `last`
+        # halfway is compared against the Int64 index, so it must be Int64 too; `last`
         # (steps-1) participates in the float arithmetic, so it takes the compute dtype.
-        (ct(start), ct(end), ct(step), dt.Int32(steps // 2), ct(steps - 1)),
+        (ct(start), ct(end), ct(step), dt.Int64(steps // 2), ct(steps - 1)),
         ct,
         compute,
         [],

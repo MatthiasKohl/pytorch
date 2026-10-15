@@ -25,7 +25,6 @@
 # Addressing is canonical CuTe in both paths -- no hand-rolled offset math.
 
 import math
-import os
 from collections.abc import Sequence
 from typing import Any, NamedTuple
 
@@ -41,7 +40,6 @@ import torch
 from ...cutedsl import hw_caps as _hw, launch as _L
 from ...cutedsl.dtypes import torch2cute
 from ...cutedsl.plan_cache import cached_plan
-from .indexing import can_use_32bit_index_math
 
 
 # Exposed perf knobs (autotunable). run() fills any knob left None from _choose_config
@@ -85,6 +83,30 @@ _PLAN = {}  # key -> _Plan (compiled kernel + shape-invariant launch decisions)
 # carries no shape (dynamic nvec) and no path's key carries scalar values (runtime
 # args), so kernel count is O(op x dtype-combo x knobs), not O(call diversity).
 _KERNELS = {}
+_SCALAR_FUNCTIONS: dict[tuple, Any] = {}
+
+
+class _ScalarOperands:
+    def __init__(self, fn: Any, scalar_mask: tuple[bool, ...]) -> None:
+        self.fn = fn
+        self.scalar_mask = scalar_mask
+        self.nargs = len(scalar_mask)
+        self.nscalars = sum(scalar_mask)
+        self.ninputs = self.nargs - self.nscalars
+        self.tensor_indices = tuple(
+            sum(not v for v in scalar_mask[:i]) for i in range(self.nargs)
+        )
+        self.scalar_indices = tuple(sum(scalar_mask[:i]) for i in range(self.nargs))
+
+    @cute.jit
+    def __call__(self, *args: Any) -> Any:
+        values = []
+        for i in cutlass.range_constexpr(self.nargs):
+            if const_expr(self.scalar_mask[i]):
+                values.append(args[self.ninputs + self.scalar_indices[i]])
+            else:
+                values.append(args[self.tensor_indices[i]])
+        return self.fn(*values, *args[self.ninputs + self.nscalars :])
 
 
 class _PointwiseConfig(NamedTuple):
@@ -166,6 +188,7 @@ class _ElementwiseVec:
         load,
         pipe_depth,
         in_dtype,
+        index_type=cutlass.Int32,
     ):
         self.fn = fn
         self.nin = nin
@@ -182,10 +205,11 @@ class _ElementwiseVec:
         # smem allocations: under TMA mIns[k].element_type is a descriptor union, not
         # a plain Numeric, so we can't read it off the wrapped tensor there.
         self.in_dtype = in_dtype
+        self.index_type = index_type
 
     @cute.jit
     def __call__(self, mIns: list, mOuts: list, consts: list, stream: cuda.CUstream):
-        nvec = mOuts[0].shape[0]
+        nvec = self.index_type(mOuts[0].shape[0])
         tile = const_expr(self.block * self.ept)  # vec-rows retired per block
         # tile-mode TMA atoms (host-compile-time, inside the jit region), one per
         # input; only the tma load path uses them. ept==1 for tma (host guard), so the
@@ -232,13 +256,11 @@ class _ElementwiseVec:
             cute.autovec_copy(outs[j], mOuts[j][i, None])
 
     @cute.kernel
-    def kernel(
-        self, mIns: list, mOuts: list, consts: list, nvec: cutlass.Int32, tma_atoms
-    ):
+    def kernel(self, mIns: list, mOuts: list, consts: list, nvec, tma_atoms):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         block = const_expr(self.block)
-        base = bidx * const_expr(block * self.ept) + tidx
+        base = self.index_type(bidx) * const_expr(block * self.ept) + tidx
         if const_expr(self.load == "direct"):
             # gmem->rmem inline, per-thread block-strided ept-unrolled loop.
             for p in cutlass.range_constexpr(self.ept):
@@ -391,7 +413,17 @@ class _ElementwiseStrided:
     # on this path because the vec/rowvec routes hand the fn a vector fragment rather
     # than one element, so there is no single index to give it.
     def __init__(
-        self, fn, nin, nout, nconsts, compute, out_types, block, ept, with_index=False
+        self,
+        fn,
+        nin,
+        nout,
+        nconsts,
+        compute,
+        out_types,
+        block,
+        ept,
+        with_index=False,
+        index_type=cutlass.Int32,
     ):
         self.fn = fn
         self.nin = nin
@@ -402,10 +434,11 @@ class _ElementwiseStrided:
         self.block = block
         self.ept = ept
         self.with_index = with_index
+        self.index_type = index_type
 
     @cute.jit
     def __call__(self, mIns: list, mOuts: list, consts: list, stream: cuda.CUstream):
-        n = cute.size(mOuts[0])
+        n = self.index_type(cute.size(mOuts[0]))
         tile = const_expr(self.block * self.ept)
         self.kernel(mIns, mOuts, consts, n).launch(
             grid=[cute.ceil_div(n, tile), 1, 1],
@@ -414,11 +447,11 @@ class _ElementwiseStrided:
         )
 
     @cute.kernel
-    def kernel(self, mIns: list, mOuts: list, consts: list, n: cutlass.Int32):
+    def kernel(self, mIns: list, mOuts: list, consts: list, n):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         block = const_expr(self.block)
-        base = bidx * const_expr(block * self.ept) + tidx
+        base = self.index_type(bidx) * const_expr(block * self.ept) + tidx
         for p in cutlass.range_constexpr(self.ept):
             i = base + p * block
             if i < n:
@@ -446,7 +479,19 @@ class _ElementwiseRowVec:
     # V-fragment: the within-row V load is a contiguous 128-bit vector (coalesced), only
     # the row base is gapped -- the density aten's scalar offset path ignores (~2x aten).
     # Reuses _ElementwiseVec._compute_store's per-element fn+cast+store over the V lane.
-    def __init__(self, fn, nin, nout, nconsts, compute, out_types, V, ncv, block):
+    def __init__(
+        self,
+        fn,
+        nin,
+        nout,
+        nconsts,
+        compute,
+        out_types,
+        V,
+        ncv,
+        block,
+        index_type=cutlass.Int32,
+    ):
         self.fn = fn
         self.nin = nin
         self.nout = nout
@@ -456,11 +501,12 @@ class _ElementwiseRowVec:
         self.V = V
         self.ncv = ncv  # vec-chunks per row (run // V)
         self.block = block
+        self.index_type = index_type
 
     @cute.jit
     def __call__(self, mIns: list, mOuts: list, consts: list, stream: cuda.CUstream):
         rows = mOuts[0].shape[0]
-        nvec = rows * const_expr(self.ncv)  # total (row, chunk) fragments
+        nvec = self.index_type(rows) * const_expr(self.ncv)
         self.kernel(mIns, mOuts, consts, nvec).launch(
             grid=[cute.ceil_div(nvec, self.block), 1, 1],
             block=[self.block, 1, 1],
@@ -468,10 +514,10 @@ class _ElementwiseRowVec:
         )
 
     @cute.kernel
-    def kernel(self, mIns: list, mOuts: list, consts: list, nvec: cutlass.Int32):
+    def kernel(self, mIns: list, mOuts: list, consts: list, nvec):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        i = bidx * const_expr(self.block) + tidx
+        i = self.index_type(bidx) * const_expr(self.block) + tidx
         ncv = const_expr(self.ncv)
         V = const_expr(self.V)
         if i < nvec:
@@ -603,10 +649,10 @@ def _view_vec(t, V):
     return t.reshape(-1, V)
 
 
-def _fake_vec(t, V, dyn):
+def _fake_vec(t, V, dyn, index_type=cutlass.Int32):
     # 16-byte alignment: torch allocations are >=256 B aligned and V*itemsize == 128 bits, so the
     # wide load is safe. `dyn` leaves the vector COUNT symbolic, so one kernel serves every numel.
-    lead = _L.sym() if dyn else t.numel() // V
+    lead = cute.sym_int(width=index_type.width) if dyn else t.numel() // V
     return _L.fake_compact(
         torch2cute[t.dtype], (lead, V), stride_order=(1, 0), align=16
     )
@@ -669,6 +715,25 @@ class _Plan(NamedTuple):
     out_dtypes: tuple  # per-output torch dtype (its length is the output count)
     fn: object  # the compiled kernel
     rowgap: tuple = ()  # (rows, run, row_step) for the rowvec path; () otherwise
+
+
+def _index_type(
+    tensors: Sequence[torch.Tensor],
+    shape: Sequence[int],
+    tile: int,
+) -> type[cutlass.Numeric]:
+    limit = torch.iinfo(torch.int32).max
+    numel = math.prod(shape)
+    if ((numel + tile - 1) // tile) * tile > limit:
+        return cutlass.Int64
+    for tensor in tensors:
+        offset = sum(
+            (size - 1) * abs(stride)
+            for size, stride in zip(tensor.shape, tensor.stride())
+        )
+        if offset > limit:
+            return cutlass.Int64
+    return cutlass.Int32
 
 
 def _build_plan(
@@ -770,10 +835,9 @@ def _build_plan(
     # fn a whole V-wide fragment, not one element, so there is no single index to pass), so
     # skip the vec/rowvec tests entirely and let the else-branch below take it.
     vec1 = not with_index and _vec_ok(inputs, shape, out_dtypes, compute_torch, V, ref)
-    if not can_use_32bit_index_math(
+    index_type = _index_type(
         (*inputs, *seed_outs), shape, block * ept * (V if vec1 else 1)
-    ):
-        raise ValueError("pointwise operands exceed signed 32-bit indexing")
+    )
     if vec1 and load != "tma":
         # tma is excluded from the dynamic wrap: make_tiled_tma_atom builds a
         # descriptor from the (static) tile extents; the rare tma plan falls to the
@@ -791,11 +855,12 @@ def _build_plan(
             load,
             pipe_depth,
             torch2cute[ref.dtype],
+            index_type,
         )
-        cin = [_fake_vec(t, V, True) for t in inputs]
-        cout = [_fake_vec(o, V, True) for o in seed_outs]
+        cin = [_fake_vec(t, V, True, index_type) for t in inputs]
+        cout = [_fake_vec(o, V, True, index_type) for o in seed_outs]
         path = "vec"
-        kkey = common + ("vec", V, block, ept, load, pipe_depth)
+        kkey = common + ("vec", V, block, ept, load, pipe_depth, index_type)
     elif vec1:
         op = _ElementwiseVec(
             fn,
@@ -810,11 +875,21 @@ def _build_plan(
             load,
             pipe_depth,
             torch2cute[ref.dtype],
+            index_type,
         )
         cin = [_fake_vec(t, V, False) for t in inputs]
         cout = [_fake_vec(o, V, False) for o in seed_outs]
         path = "vec_static"
-        kkey = common + ("vec_static", shape, V, block, ept, load, pipe_depth)
+        kkey = common + (
+            "vec_static",
+            shape,
+            V,
+            block,
+            ept,
+            load,
+            pipe_depth,
+            index_type,
+        )
     elif (
         not with_index
         and (rg := _rowvec_ok(inputs, shape, out_dtypes, compute_torch, V)) is not None
@@ -823,15 +898,33 @@ def _build_plan(
         # output is dense, so its run == its full row-length; only inputs carry the gap.
         rows, run, row_step = rg
         op = _ElementwiseRowVec(
-            fn, nin, nout, len(consts), compute, out_types, V, run // V, block
+            fn,
+            nin,
+            nout,
+            len(consts),
+            compute,
+            out_types,
+            V,
+            run // V,
+            block,
+            index_type,
         )
         cin = [_fake_rowvec(t, rows, run, row_step, V) for t in inputs]
         cout = [_fake_rowvec(o, rows, run, run, V) for o in seed_outs]
         path, rowgap = "rowvec", rg
-        kkey = common + ("rowvec", rg, V, block)
+        kkey = common + ("rowvec", rg, V, block, index_type)
     else:
         op = _ElementwiseStrided(
-            fn, nin, nout, len(consts), compute, out_types, block, ept, with_index
+            fn,
+            nin,
+            nout,
+            len(consts),
+            compute,
+            out_types,
+            block,
+            ept,
+            with_index,
+            index_type,
         )
         cin = [_fake_strided(t, shape) for t in inputs]
         cout = [_fake_strided(o, tuple(o.shape)) for o in seed_outs]
@@ -843,7 +936,7 @@ def _build_plan(
         # gets handed a differently-strided one and from_dlpack rejects it at launch.
         lays = tuple((tuple(t.shape), t.stride()) for t in inputs)
         out_lays = tuple((tuple(o.shape), o.stride()) for o in seed_outs)
-        kkey = common + ("strided", shape, lays, out_lays, block, ept)
+        kkey = common + ("strided", shape, lays, out_lays, block, ept, index_type)
     # Compile against PLACEHOLDER scalar values, not the live ones. The scalars are
     # genuine runtime arguments (they arrive as %arg f32/i32 in the IR), but the DSL
     # mangles every non-IR argument's VALUE into the generated MLIR symbol name, so
@@ -891,11 +984,28 @@ def run(
     # they are the broadcast shape, right dtype, and contiguous; the override cond gates
     # that). None -> allocate fresh outputs (the functional path).
     if out is not None and nout == 1 and not with_index:
+        from . import tuned
+
         knobs = (block, ept, vec_bits, load, pipe_depth)
-        if all(value is None for value in knobs) and _try_run_tuned(
+        if all(value is None for value in knobs) and tuned.try_run(
             fn, key, inputs, out[0], consts, compute
         ):
             return tuple(out)
+    scalar_mask = tuple(t.device.type == "cpu" and t.dim() == 0 for t in inputs)
+    if any(scalar_mask):
+        scalar_key = (id(fn), scalar_mask)
+        scalar_fn = _SCALAR_FUNCTIONS.get(scalar_key)
+        if scalar_fn is None:
+            scalar_fn = _ScalarOperands(fn, scalar_mask)
+            _SCALAR_FUNCTIONS[scalar_key] = scalar_fn
+        fn = scalar_fn
+        scalar_consts = tuple(
+            compute(t.item()) for t, scalar in zip(inputs, scalar_mask) if scalar
+        )
+        consts = scalar_consts + tuple(consts)
+        inputs = tuple(t for t, scalar in zip(inputs, scalar_mask) if not scalar)
+        nin = len(inputs)
+        key = (*key, scalar_mask)
     plan = cached_plan(
         _PLAN,
         key,
@@ -953,653 +1063,3 @@ def run(
     # straight to the launch, so a new alpha/lambd/... is never a recompile.
     plan.fn(cin, cout, list(consts), _L.stream())
     return tuple(outs)
-
-
-_BLOCK_THREADS = 128
-_ELEMENTS_PER_THREAD = 8
-_TILES_PER_BLOCK = 6
-_MIN_RUBIN_IO_BYTES = 16 * 1024 * 1024
-_RUBIN_CC = (10, 7)
-_CONST_SLOTS = 3
-_TUNED_PLAN = {}
-_TUNING_ENABLED = os.getenv("TORCH_NATIVE_CUTEDSL_POINTWISE_TUNING", "1") != "0"
-_SUPPORTED_TUNED_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
-
-
-class _TunedVectorConfig(NamedTuple):
-    path: str
-    vec: int
-    elements_per_thread: int
-
-
-class _TunedTmaConfig(NamedTuple):
-    path: str
-    transposed: tuple[bool, ...]
-    box: int
-    block: int
-    input_views: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]
-    output_view: tuple[tuple[int, ...], tuple[int, ...]]
-
-
-class _TunedPlan(NamedTuple):
-    config: _TunedVectorConfig | _TunedTmaConfig
-    fn: Any
-
-
-def _pointer(t: torch.Tensor) -> int:
-    with torch._C.DisableTorchFunctionSubclass():
-        return t.const_data_ptr()
-
-
-def _vector_config(
-    inputs: Sequence[torch.Tensor],
-    shape: tuple[int, ...],
-    output_address: int,
-    out_dtype: torch.dtype | None = None,
-) -> _TunedVectorConfig | None:
-    if not inputs or any(
-        tuple(t.shape) != shape or not t.is_contiguous() for t in inputs
-    ):
-        return None
-    dtype = inputs[0].dtype
-    itemsize = dtype.itemsize
-    out_dtype = dtype if out_dtype is None else out_dtype
-    numel = math.prod(shape)
-    cc = _hw.caps(inputs[0].device).cc
-    io_bytes = numel * (len(inputs) * itemsize + out_dtype.itemsize)
-    if cc == _RUBIN_CC and io_bytes >= _MIN_RUBIN_IO_BYTES:
-        vec = min(8, 32 // itemsize)
-        input_bytes = len(inputs) * itemsize
-        thread_work = (
-            1 if input_bytes >= 128 else 128 // (1 << (input_bytes - 1).bit_length())
-        )
-        thread_work = thread_work if thread_work >= 8 and vec == 8 else 8
-    else:
-        vec = min(8, 16 // itemsize)
-        thread_work = 8
-    alignment = vec * itemsize
-    if numel == 0 or numel % vec or output_address % (vec * out_dtype.itemsize):
-        return None
-    nvec = numel // vec
-    span = _BLOCK_THREADS * (thread_work // vec)
-    blocks = (nvec + span - 1) // span
-    limit = torch.iinfo(torch.int32).max
-    if blocks > limit:
-        return None
-    if any(_pointer(t) % alignment for t in inputs):
-        return None
-    return _TunedVectorConfig("vector", vec, thread_work // vec)
-
-
-def _tma_geometry(element_bytes: int) -> tuple[int, int] | None:
-    if element_bytes == 1:
-        return 64, 512
-    if element_bytes in (2, 4):
-        return 32, 128
-    if element_bytes == 8:
-        return 16, 32
-    return None
-
-
-def _physical_dim_order(strides: tuple[int, ...]) -> tuple[int, ...] | None:
-    if not strides or any(stride <= 0 for stride in strides):
-        return None
-    order = tuple(sorted(range(len(strides)), key=strides.__getitem__))
-    if strides[order[0]] != 1:
-        return None
-    if any(strides[order[i]] <= strides[order[i - 1]] for i in range(1, len(order))):
-        return None
-    return order
-
-
-def _dense_run(
-    shape: tuple[int, ...], strides: tuple[int, ...], dims: tuple[int, ...]
-) -> bool:
-    return all(
-        shape[dims[i - 1]] * strides[dims[i - 1]] == strides[dims[i]]
-        for i in range(1, len(dims))
-    )
-
-
-def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
-    strides = [0] * len(shape)
-    stride = 1
-    for dim in range(len(shape) - 1, -1, -1):
-        strides[dim] = stride
-        stride *= shape[dim]
-    return tuple(strides)
-
-
-def _tma2d_config(
-    inputs: Sequence[torch.Tensor],
-    shape: tuple[int, ...],
-    output_address: int,
-) -> _TunedTmaConfig | None:
-    if len(shape) < 2 or not inputs:
-        return None
-    dtype = inputs[0].dtype
-    geometry = _tma_geometry(dtype.itemsize)
-    if geometry is None or _hw.caps(inputs[0].device).cc < (9, 0):
-        return None
-    if (
-        any(size <= 0 or size > torch.iinfo(torch.int32).max for size in shape)
-        or output_address % 16
-        or any(tuple(t.shape) != shape for t in inputs)
-    ):
-        return None
-
-    output_strides = _contiguous_strides(shape)
-    output_order = _physical_dim_order(output_strides)
-    if output_order is None:
-        return None
-    output_positions = {dim: position for position, dim in enumerate(output_order)}
-    input_orders = []
-    for t in inputs:
-        order = _physical_dim_order(t.stride())
-        if order is None:
-            return None
-        input_orders.append(tuple(output_positions[dim] for dim in order))
-
-    box, block = geometry
-    tile_bytes = box * box * dtype.itemsize
-    smem_bytes = len(inputs) * (_TILES_PER_BLOCK * tile_bytes + 1024)
-    smem_bytes += _TILES_PER_BLOCK * 8
-    if smem_bytes > _hw.caps(inputs[0].device).smem_per_block_optin:
-        return None
-
-    ndim = len(shape)
-    identity_order = tuple(range(ndim))
-    for a_end in range(1, ndim):
-        for b_end in range(a_end + 1, ndim + 1):
-            swapped_order = (
-                tuple(range(a_end, b_end))
-                + tuple(range(a_end))
-                + tuple(range(b_end, ndim))
-            )
-            transposed = []
-            for order in input_orders:
-                if order == identity_order:
-                    transposed.append(False)
-                elif order == swapped_order:
-                    transposed.append(True)
-                else:
-                    break
-            else:
-                if not any(transposed):
-                    continue
-                a_dims = output_order[:a_end]
-                b_dims = output_order[a_end:b_end]
-                batch_dims = output_order[b_end:]
-                shape_a = math.prod(shape[dim] for dim in a_dims)
-                shape_b = math.prod(shape[dim] for dim in b_dims)
-                batch = math.prod(shape[dim] for dim in batch_dims)
-                grid_x = (shape_a + box * _TILES_PER_BLOCK - 1) // (
-                    box * _TILES_PER_BLOCK
-                )
-                if (
-                    shape_a * batch > torch.iinfo(torch.int32).max
-                    or shape_b * batch > torch.iinfo(torch.int32).max
-                    or grid_x > torch.iinfo(torch.int32).max
-                    or shape_b // box > 65535
-                    or batch > 65535
-                    or shape_a % box
-                    or shape_b % box
-                    or shape_a * dtype.itemsize % 16
-                ):
-                    continue
-
-                input_views = []
-                valid = True
-                for t, is_transposed in zip(inputs, transposed):
-                    first = b_dims if is_transposed else a_dims
-                    second = a_dims if is_transposed else b_dims
-                    second_and_batch = second + batch_dims
-                    if not _dense_run(shape, t.stride(), first) or not _dense_run(
-                        shape, t.stride(), second_and_batch
-                    ):
-                        valid = False
-                        break
-                    fast_extent = shape_b if is_transposed else shape_a
-                    higher_stride = t.stride()[second[0]]
-                    required_alignment = 128 if is_transposed else 16
-                    if (
-                        _pointer(t) % required_alignment
-                        or higher_stride < fast_extent
-                        or fast_extent * dtype.itemsize % 16
-                        or higher_stride * dtype.itemsize % 16
-                        or higher_stride * dtype.itemsize >= 1 << 40
-                    ):
-                        valid = False
-                        break
-                    if is_transposed:
-                        view = (
-                            (shape_b, batch * shape_a),
-                            (t.stride()[first[0]], higher_stride),
-                        )
-                    else:
-                        view = (
-                            (batch * shape_b, shape_a),
-                            (higher_stride, t.stride()[first[0]]),
-                        )
-                    input_views.append(view)
-                if not valid:
-                    continue
-
-                output_stride_a = output_strides[a_dims[0]]
-                output_stride_b = output_strides[b_dims[0]]
-                output_batch_stride = (
-                    output_strides[batch_dims[0]]
-                    if batch_dims
-                    else shape_b * output_stride_b
-                )
-                if (
-                    output_stride_b * dtype.itemsize % 16
-                    or output_batch_stride * dtype.itemsize % 16
-                ):
-                    continue
-                return _TunedTmaConfig(
-                    "tma2d",
-                    tuple(transposed),
-                    box,
-                    block,
-                    tuple(input_views),
-                    (
-                        (batch, shape_b, shape_a),
-                        (output_batch_stride, output_stride_b, output_stride_a),
-                    ),
-                )
-    return None
-
-
-def _select_config(
-    inputs: Sequence[torch.Tensor],
-    shape: tuple[int, ...],
-    output_address: int,
-    out_dtype: torch.dtype,
-    allow_tma: bool = True,
-) -> _TunedVectorConfig | _TunedTmaConfig | None:
-    if allow_tma:
-        config = _tma2d_config(inputs, shape, output_address)
-        if config is not None:
-            return config
-    return _vector_config(inputs, shape, output_address, out_dtype)
-
-
-def can_run_tuned(
-    inputs: Sequence[torch.Tensor],
-    shape: Sequence[int],
-    out_dtype: torch.dtype,
-    target: torch.Tensor | None = None,
-    allow_tma: bool = True,
-) -> bool:
-    if not _TUNING_ENABLED or not inputs:
-        return False
-    tensors = inputs
-    if not tensors or out_dtype not in (*_SUPPORTED_TUNED_DTYPES, torch.bool):
-        return False
-    if not can_use_32bit_index_math(
-        (*tensors, target) if target is not None else tensors, shape
-    ):
-        return False
-    ref = tensors[0]
-    if ref.device.type != "cuda" or _hw.caps(ref.device).cc != _RUBIN_CC:
-        return False
-    if ref.dtype not in _SUPPORTED_TUNED_DTYPES or out_dtype not in (
-        ref.dtype,
-        torch.bool,
-    ):
-        return False
-    if any(
-        t.device != ref.device
-        or t.dtype != ref.dtype
-        or t.numel() == 0
-        or t.storage_offset() != 0
-        or t.is_neg()
-        or t.is_conj()
-        for t in tensors
-    ):
-        return False
-    if target is not None:
-        if (
-            target.device != ref.device
-            or target.dtype != out_dtype
-            or tuple(target.shape) != tuple(shape)
-            or not target.is_contiguous()
-            or target.storage_offset() != 0
-            or target.is_neg()
-            or target.is_conj()
-            or torch._C._is_cow_tensor(target)  # pyrefly: ignore[missing-attribute]
-        ):
-            return False
-        for t in tensors:
-            if torch._C._overlaps(target, t) and not (
-                t.is_contiguous()
-                and t.stride() == target.stride()
-                and _pointer(t) == _pointer(target)
-            ):
-                return False
-    address = 0 if target is None else _pointer(target)
-    return (
-        _select_config(tensors, tuple(shape), address, out_dtype, allow_tma) is not None
-    )
-
-
-def _tma_smem_layout(dtype: Any, box: int, transposed: bool) -> Any:
-    inner_bytes = box * dtype.width // 8
-    if not transposed:
-        swizzle_bits = 0
-    elif inner_bytes <= 32:
-        swizzle_bits = 1
-    elif inner_bytes <= 64:
-        swizzle_bits = 2
-    else:
-        swizzle_bits = 3
-    swizzle = cute.make_swizzle(swizzle_bits, 4, 3)
-    atom_bytes = 1 << (7 + swizzle_bits)
-    atom_elements = atom_bytes * 8 // (8 * dtype.width)
-    if transposed:
-        outer = cute.make_layout((atom_elements, 8), stride=(1, atom_elements))
-        order = (1, 0, 2)
-    else:
-        outer = cute.make_layout((8, atom_elements), stride=(atom_elements, 1))
-        order = (0, 1, 2)
-    atom = cute.make_composed_layout(swizzle, 0, outer)
-    return cute.tile_to_shape(atom, (box, box, _TILES_PER_BLOCK), order=order)
-
-
-class _ElementwiseTma2D:
-    def __init__(
-        self,
-        fn: Any,
-        ninputs: int,
-        nconsts: int,
-        compute: Any,
-        out_type: Any,
-        in_dtype: Any,
-        config: _TunedTmaConfig,
-    ) -> None:
-        self.fn = fn
-        self.ninputs = ninputs
-        self.nconsts = nconsts
-        self.compute = compute
-        self.out_type = out_type
-        self.in_dtype = in_dtype
-        self.transposed = config.transposed
-        self.box = config.box
-        self.block = config.block
-
-    @cute.jit
-    def __call__(
-        self,
-        mIns: list,
-        mOut: cute.Tensor,
-        const0,
-        const1,
-        const2,
-        stream: cuda.CUstream,
-    ) -> None:
-        tma_inputs = []
-        layouts = []
-        for k in cutlass.range_constexpr(self.ninputs):
-            layout = _tma_smem_layout(self.in_dtype, self.box, self.transposed[k])
-            info = cpasync.make_tiled_tma_atom(
-                cpasync.CopyBulkTensorTileG2SOp(), mIns[k], layout, (self.box, self.box)
-            )
-            tma_inputs.append(
-                (info, cute.zipped_divide(info.tma_tensor, (self.box, self.box)))
-            )
-            layouts.append(layout)
-        batch, rows, cols = mOut.shape
-        self.kernel(
-            tma_inputs,
-            mOut,
-            const0,
-            const1,
-            const2,
-            layouts,
-        ).launch(
-            grid=[
-                cute.ceil_div(cols, self.box * _TILES_PER_BLOCK),
-                cute.ceil_div(rows, self.box),
-                batch,
-            ],
-            block=[self.block, 1, 1],
-            stream=stream,
-        )
-
-    @cute.kernel
-    def kernel(
-        self,
-        tma_inputs,
-        mOut: cute.Tensor,
-        const0,
-        const1,
-        const2,
-        layouts: Any,
-    ) -> None:
-        tidx, _, _ = cute.arch.thread_idx()
-        fast_group, slow_tile, batch = cute.arch.block_idx()
-        fast_tile = fast_group * _TILES_PER_BLOCK
-        fast_tiles = mOut.shape[2] // const_expr(self.box)
-        slow_tiles = mOut.shape[1] // const_expr(self.box)
-        valid_stages = cutlass.min(fast_tiles - fast_tile, _TILES_PER_BLOCK)
-
-        smem = cutlass.memory.SmemAllocator()
-        buffers = [
-            smem.allocate_tensor(
-                self.in_dtype,
-                layouts[k].outer,
-                byte_alignment=1024,
-                swizzle=layouts[k].inner,
-            )
-            for k in range(const_expr(self.ninputs))
-        ]
-        barriers = smem.allocate_array(cutlass.Int64, num_elems=_TILES_PER_BLOCK)
-        tx_bytes = const_expr(
-            self.ninputs * self.box * self.box * self.in_dtype.width // 8
-        )
-
-        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        if warp_idx == 0:
-            for k in cutlass.range_constexpr(self.ninputs):
-                cpasync.prefetch_descriptor(tma_inputs[k][0].atom)
-            for stage in cutlass.range_constexpr(_TILES_PER_BLOCK):
-                if stage < valid_stages:
-                    barrier = barriers + stage
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_init(barrier, 1)
-                        cute.arch.fence_proxy(kind="async.shared", space="cta")
-                    for k in cutlass.range_constexpr(self.ninputs):
-                        info, tiled = tma_inputs[k]
-                        if const_expr(self.transposed[k]):
-                            tile_coord = (
-                                slow_tile,
-                                batch * fast_tiles + fast_tile + stage,
-                            )
-                        else:
-                            tile_coord = (
-                                batch * slow_tiles + slow_tile,
-                                fast_tile + stage,
-                            )
-                        g_tile = tiled[((None, None), tile_coord)]
-                        s_tile = buffers[k][None, None, stage]
-                        cutlass.block.block_copy(
-                            info.atom,
-                            cute.group_modes(g_tile, 0, 2),
-                            cute.group_modes(s_tile, 0, 2),
-                            tma_bar_ptr=barrier,
-                        )
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(barrier, tx_bytes)
-        cute.arch.barrier()
-
-        lane = tidx & 31
-        warp_iteration = (tidx >> 5) * _ELEMENTS_PER_THREAD
-        slow_base = slow_tile * const_expr(self.box)
-        for stage in cutlass.range_constexpr(_TILES_PER_BLOCK):
-            if stage < valid_stages:
-                cute.arch.mbarrier_wait(barriers + stage, 0)
-                fast_base = (fast_tile + stage) * const_expr(self.box)
-                for i in cutlass.range_constexpr(_ELEMENTS_PER_THREAD):
-                    wi = warp_iteration + i
-                    if const_expr(self.in_dtype.width == 32):
-                        fast = lane
-                        slow = wi ^ (lane >> 3)
-                    elif const_expr(self.in_dtype.width == 16):
-                        fast = lane
-                        slow = wi ^ ((lane >> 4) << 1)
-                    elif const_expr(self.in_dtype.width == 8):
-                        fast = lane | ((wi & 1) << 5)
-                        slow = wi >> 1
-                    else:
-                        local = wi * 32 + lane
-                        fast = local & 15
-                        slow = local >> 4
-                    values = []
-                    for k in cutlass.range_constexpr(self.ninputs):
-                        values.append(self.compute(buffers[k][slow, fast, stage]))
-                    if const_expr(self.nconsts == 0):
-                        value = self.fn(*values)
-                    elif const_expr(self.nconsts == 1):
-                        value = self.fn(*values, const0)
-                    elif const_expr(self.nconsts == 2):
-                        value = self.fn(*values, const0, const1)
-                    else:
-                        value = self.fn(*values, const0, const1, const2)
-                    mOut[batch, slow_base + slow, fast_base + fast] = self.out_type(
-                        value
-                    )
-
-
-def _fake_tensor(
-    dtype: Any, view: tuple[tuple[int, ...], tuple[int, ...]], align: int
-) -> Any:
-    shape, stride = view
-    return cute.runtime.make_fake_tensor(
-        dtype, tuple(shape), stride=tuple(stride), assumed_align=align
-    )
-
-
-def _compile_tuned_plan(
-    fn: Any,
-    key: tuple[Any, ...],
-    inputs: Sequence[torch.Tensor],
-    out: torch.Tensor,
-    consts: Sequence[Any],
-    compute: type[cutlass.Numeric],
-) -> _TunedPlan:
-    config = _select_config(inputs, tuple(out.shape), _pointer(out), out.dtype)
-    if config is None:
-        raise AssertionError("pointwise override selected an unsupported launch")
-    in_type = torch2cute[inputs[0].dtype]
-    out_type = cutlass.Int8 if out.dtype == torch.bool else torch2cute[out.dtype]
-    if isinstance(config, _TunedVectorConfig):
-        op = _ElementwiseVec(
-            fn,
-            len(inputs),
-            1,
-            len(consts),
-            compute,
-            (out_type,),
-            config.vec,
-            _BLOCK_THREADS,
-            config.elements_per_thread,
-            "direct",
-            1,
-            in_type,
-        )
-        fakes = [
-            _L.fake_compact(
-                in_type,
-                (cute.sym_int(width=32), config.vec),
-                stride_order=(1, 0),
-                align=config.vec * inputs[0].element_size(),
-            )
-            for _ in inputs
-        ]
-        fake_out = _L.fake_compact(
-            out_type,
-            (cute.sym_int(width=32), config.vec),
-            stride_order=(1, 0),
-            align=config.vec * out.element_size(),
-        )
-        compile_args = (fakes, [fake_out], [compute(1) for _ in consts], _L.stream())
-    else:
-        op = _ElementwiseTma2D(
-            fn, len(inputs), len(consts), compute, out_type, in_type, config
-        )
-        fakes = [
-            _fake_tensor(in_type, view, 128 if config.transposed[k] else 16)
-            for k, view in enumerate(config.input_views)
-        ]
-        fake_out = _fake_tensor(out_type, config.output_view, 16)
-        compile_args = (fakes, fake_out, *([compute(1)] * _CONST_SLOTS), _L.stream())
-    caps = _hw.caps(inputs[0].device)
-    kernel_key = (
-        "tuned",
-        id(fn),
-        len(consts),
-        compute,
-        in_type,
-        out_type,
-        config,
-        inputs[0].device.index,
-        caps.cc,
-        caps.smem_per_block_optin,
-    )
-    compiled = cached_plan(
-        _KERNELS,
-        kernel_key,
-        lambda: _L.compile_kernel(op, *compile_args),
-        op=f"aten::{key[0]}",
-    )
-    return _TunedPlan(config, compiled)
-
-
-def _try_run_tuned(
-    fn: Any,
-    key: tuple[Any, ...],
-    inputs: Sequence[torch.Tensor],
-    out: torch.Tensor,
-    consts: Sequence[Any],
-    compute: type[cutlass.Numeric],
-) -> bool:
-    if len(consts) > _CONST_SLOTS or not can_run_tuned(
-        inputs, out.shape, out.dtype, out
-    ):
-        return False
-    caps = _hw.caps(inputs[0].device)
-    plan_key = (
-        key[0],
-        id(fn),
-        compute,
-        tuple((t.dtype, tuple(t.shape), t.stride()) for t in inputs),
-        out.dtype,
-        out.stride(),
-        len(consts),
-        inputs[0].device.index,
-        caps.cc,
-        caps.smem_per_block_optin,
-        tuple(_pointer(t) % 128 for t in inputs),
-        _pointer(out) % 128,
-    )
-    plan = cached_plan(
-        _TUNED_PLAN,
-        plan_key,
-        lambda: _compile_tuned_plan(fn, key, inputs, out, consts, compute),
-    )
-    output = out.view(torch.int8) if out.dtype == torch.bool else out
-    if isinstance(plan.config, _TunedVectorConfig):
-        vec = plan.config.vec
-        runtime_inputs = [_L.read_only(t.reshape(-1, vec)) for t in inputs]
-        runtime_out = output.reshape(-1, vec)
-        plan.fn(runtime_inputs, [runtime_out], list(consts), _L.stream())
-    else:
-        runtime_inputs = [
-            _L.read_only(t.as_strided(*plan.config.input_views[k]))
-            for k, t in enumerate(inputs)
-        ]
-        runtime_out = output.as_strided(*plan.config.output_view)
-        runtime_consts = list(consts) + [compute(1)] * (_CONST_SLOTS - len(consts))
-        plan.fn(runtime_inputs, runtime_out, *runtime_consts, _L.stream())
-    return True
