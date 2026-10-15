@@ -29,17 +29,34 @@
 //
 
 #include <array>
+#include <algorithm>
 #include <bit>
+#include <cstdint>
 #include <tuple>
 #include <type_traits>
 
+#include <ATen/Context.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/Exceptions.h>
 #include <ATen/detail/FunctionTraits.h>
 #include <ATen/native/TensorIterator.h>
 #include <c10/core/DynamicCast.h>
 #include <c10/core/ScalarType.h>
 #include <c10/macros/Macros.h>
+#include <c10/util/SmallVector.h>
 #include <c10/util/TypeCast.h>
+#include <c10/util/env.h>
+
+#if !defined(USE_ROCM)
+#include <ATen/cuda/nvrtc_stub/ATenNVRTC.h>
+#endif
+
+#if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
+#include <cuda/ptx>
+#define AT_CUDA_TMA_ELEMENTWISE_ENABLED 1
+#else
+#define AT_CUDA_TMA_ELEMENTWISE_ENABLED 0
+#endif
 
 #ifdef __NVCC__
 #define ASSERT_HOST_DEVICE_LAMBDA(type)                       \
@@ -610,6 +627,798 @@ static void launch_legacy_kernel(int64_t N, const func_t& f) {
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+template <
+    typename func_t,
+    typename index_t,
+    typename traits = function_traits<func_t>>
+C10_HOST_DEVICE typename traits::result_type invoke(
+    const func_t& f,
+    char* const C10_RESTRICT data[],
+    const index_t strides[],
+    int i);
+
+template <
+    typename func_t,
+    typename index_t,
+    typename traits = function_traits<func_t>>
+C10_HOST_DEVICE typename traits::result_type invoke(
+    const func_t& f,
+    char* const C10_RESTRICT data[],
+    const index_t strides[],
+    const ScalarType dtypes[],
+    int i);
+
+#if AT_CUDA_TMA_ELEMENTWISE_ENABLED
+namespace tma_elementwise {
+
+constexpr int kMaxThreadsPerBlock = 512;
+constexpr int kElementsPerThread = 8;
+constexpr int kTilesPerBlock = 6;
+constexpr int kVirtualRank = 2;
+constexpr int kSmemAlignment = 1024;
+
+template <int ninputs>
+struct TmaElementwiseMeta {
+  int32_t tiles_per_dim[kVirtualRank];
+  int32_t virtual_shape[kVirtualRank];
+  int32_t output_coord_stride_bytes[kVirtualRank];
+  int32_t output_batch_stride_bytes;
+  int32_t batch_count;
+  int32_t input_transposed[ninputs];
+  int32_t input_coord_stride_bytes[ninputs * kVirtualRank];
+  int32_t smem_offsets[ninputs];
+  int32_t swizzle_bytes[ninputs];
+  int32_t swizzle_masks[ninputs];
+  int32_t box_shift[kVirtualRank];
+  int32_t tile_smem_offset;
+  int32_t stage_smem_bytes;
+  int32_t total_tma_bytes;
+  int32_t smem_bytes;
+};
+
+template <int ninputs>
+struct TmaElementwiseMaps {
+  CUtensorMap maps[ninputs];
+};
+
+static inline int64_t align_up(int64_t value, int64_t alignment) {
+  return ((value + alignment - 1) / alignment) * alignment;
+}
+
+static inline bool is_aligned(const void* ptr, int64_t alignment) {
+  return reinterpret_cast<uintptr_t>(ptr) % alignment == 0;
+}
+
+static inline bool tensor_map_data_type(
+    int64_t element_size,
+    CUtensorMapDataType* data_type) {
+  switch (element_size) {
+    case 1:
+      *data_type = CU_TENSOR_MAP_DATA_TYPE_UINT8;
+      return true;
+    case 2:
+      *data_type = CU_TENSOR_MAP_DATA_TYPE_UINT16;
+      return true;
+    case 4:
+      *data_type = CU_TENSOR_MAP_DATA_TYPE_UINT32;
+      return true;
+    case 8:
+      *data_type = CU_TENSOR_MAP_DATA_TYPE_UINT64;
+      return true;
+    default:
+      return false;
+  }
+}
+
+static inline CUtensorMapSwizzle tensor_map_swizzle(int32_t swizzle_bytes) {
+  switch (swizzle_bytes) {
+    case 32:
+      return CU_TENSOR_MAP_SWIZZLE_32B;
+    case 64:
+      return CU_TENSOR_MAP_SWIZZLE_64B;
+    case 128:
+      return CU_TENSOR_MAP_SWIZZLE_128B;
+    default:
+      return CU_TENSOR_MAP_SWIZZLE_NONE;
+  }
+}
+
+template <typename T>
+using remove_cvref_t = std::remove_cv_t<std::remove_reference_t<T>>;
+
+template <typename traits, size_t input>
+constexpr int64_t arg_element_size() {
+  return sizeof(remove_cvref_t<typename traits::template arg<input>::type>);
+}
+
+template <typename traits, size_t ninputs>
+struct max_arg_element_size_impl {
+  static constexpr int64_t previous =
+      max_arg_element_size_impl<traits, ninputs - 1>::value;
+  static constexpr int64_t current =
+      arg_element_size<traits, ninputs - 1>();
+  static constexpr int64_t value = previous > current ? previous : current;
+};
+
+template <typename traits>
+struct max_arg_element_size_impl<traits, 0> {
+  static constexpr int64_t value = 0;
+};
+
+static inline bool find_physical_dim_order(
+    c10::ArrayRef<int64_t> strides,
+    int64_t element_size,
+    c10::SmallVector<int32_t, 8>& dim_order) {
+  dim_order.resize(strides.size());
+  for (const auto dim : c10::irange(strides.size())) {
+    if (strides[dim] <= 0) {
+      return false;
+    }
+    dim_order[dim] = static_cast<int32_t>(dim);
+  }
+  std::sort(
+      dim_order.begin(),
+      dim_order.end(),
+      [&](int32_t a, int32_t b) { return strides[a] < strides[b]; });
+  if (strides[dim_order[0]] != element_size) {
+    return false;
+  }
+  for (const auto dim : c10::irange(1, dim_order.size())) {
+    if (strides[dim_order[dim]] <= strides[dim_order[dim - 1]]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static inline bool is_dense_run(
+    c10::ArrayRef<int64_t> shape,
+    c10::ArrayRef<int64_t> strides,
+    c10::ArrayRef<int32_t> dims) {
+  for (const auto dim : c10::irange(1, dims.size())) {
+    int32_t previous = dims[dim - 1];
+    if (shape[previous] * strides[previous] != strides[dims[dim]]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static inline int64_t shape_product(
+    c10::ArrayRef<int64_t> shape,
+    c10::ArrayRef<int32_t> dims) {
+  int64_t product = 1;
+  for (int32_t dim : dims) {
+    if (shape[dim] > std::numeric_limits<int32_t>::max() / product) {
+      return 0;
+    }
+    product *= shape[dim];
+  }
+  return product;
+}
+
+__device__ inline uint32_t swizzled_shared_offset(
+    uint32_t byte_offset,
+    uint32_t swizzle_mask) {
+  return byte_offset ^ ((byte_offset & swizzle_mask) >> 3);
+}
+
+template <int64_t element_size>
+__device__ inline void decode_virtual_coords(
+    int warp_iteration,
+    int lane,
+    int32_t* local_coords) {
+  if constexpr (element_size == 4) {
+    local_coords[0] = lane;
+    local_coords[1] = warp_iteration ^ (lane >> 3);
+  } else if constexpr (element_size == 2) {
+    local_coords[0] = lane;
+    local_coords[1] = warp_iteration ^ ((lane >> 4) << 1);
+  } else if constexpr (element_size == 1) {
+    local_coords[0] = lane | ((warp_iteration & 1) << 5);
+    local_coords[1] = warp_iteration >> 1;
+  } else {
+    static_assert(element_size == 8);
+    const int local_idx = warp_iteration * 32 + lane;
+    local_coords[0] = local_idx & 15;
+    local_coords[1] = local_idx >> 4;
+  }
+}
+
+template <int ninputs>
+__device__ inline uint32_t input_shared_offset(
+    const TmaElementwiseMeta<ninputs>& meta,
+    int input,
+    const int32_t* local_coords) {
+  const int32_t* coord_stride =
+      meta.input_coord_stride_bytes + input * kVirtualRank;
+  const uint32_t byte_offset =
+      static_cast<uint32_t>(local_coords[0]) *
+          static_cast<uint32_t>(coord_stride[0]) +
+      static_cast<uint32_t>(local_coords[1]) *
+          static_cast<uint32_t>(coord_stride[1]);
+  return swizzled_shared_offset(
+      byte_offset, static_cast<uint32_t>(meta.swizzle_masks[input]));
+}
+
+template <typename func_t, typename array_t, int ninputs>
+C10_LAUNCH_BOUNDS_1(kMaxThreadsPerBlock)
+__global__ void tma_elementwise_kernel(
+    func_t f,
+    array_t data,
+    __grid_constant__ const TmaElementwiseMaps<ninputs> maps,
+    __grid_constant__ const TmaElementwiseMeta<ninputs> meta) {
+#if __CUDA_ARCH__ >= 900
+  using traits = function_traits<func_t>;
+  using arg0_t = typename traits::result_type;
+  constexpr int64_t max_input_element_size =
+      max_arg_element_size_impl<traits, ninputs>::value;
+  extern __shared__ char smem_base[];
+  char* smem = smem_base;
+  uint32_t smem32 = __cvta_generic_to_shared(smem);
+  smem32 = (smem32 + kSmemAlignment - 1) & ~(kSmemAlignment - 1);
+  asm("" : "+r"(smem32));
+  smem = static_cast<char*>(__cvta_shared_to_generic(smem32));
+  auto* barriers = reinterpret_cast<uint64_t*>(smem);
+
+  const int32_t block_tile =
+      static_cast<int32_t>(blockIdx.x) * kTilesPerBlock;
+  const int32_t block_tile0 = block_tile << meta.box_shift[0];
+  const int32_t block_tile1 =
+      static_cast<int32_t>(blockIdx.y) << meta.box_shift[1];
+  const int32_t batch = static_cast<int32_t>(blockIdx.z);
+  const int32_t remaining_stages = meta.tiles_per_dim[0] - block_tile;
+  const int32_t valid_stages =
+      remaining_stages < kTilesPerBlock
+      ? remaining_stages
+      : kTilesPerBlock;
+  const bool full_stages =
+      remaining_stages >= kTilesPerBlock;
+
+  auto issue_tma = [&](int stage, int32_t tile0) {
+    char* stage_smem = smem + meta.tile_smem_offset +
+        stage * meta.stage_smem_bytes;
+    for (int input = 0; input < ninputs; input++) {
+      int32_t tile_coords[kVirtualRank];
+      if (meta.input_transposed[input]) {
+        tile_coords[0] = block_tile1;
+        tile_coords[1] =
+            tile0 + batch * meta.virtual_shape[0];
+      } else {
+        tile_coords[0] = tile0;
+        tile_coords[1] =
+            block_tile1 + batch * meta.virtual_shape[1];
+      }
+      ::cuda::ptx::cp_async_bulk_tensor(
+          ::cuda::ptx::space_shared,
+          ::cuda::ptx::space_global,
+          stage_smem + meta.smem_offsets[input],
+          &maps.maps[input],
+          tile_coords,
+          &barriers[stage]);
+    }
+    ::cuda::ptx::mbarrier_arrive_expect_tx(
+        ::cuda::ptx::sem_release,
+        ::cuda::ptx::scope_cta,
+        ::cuda::ptx::space_shared,
+        &barriers[stage],
+        static_cast<uint32_t>(meta.total_tma_bytes));
+  };
+
+  if (threadIdx.x == 0) {
+    ::cuda::ptx::mbarrier_init(&barriers[0], 1);
+    ::cuda::ptx::fence_proxy_async(::cuda::ptx::space_shared);
+    issue_tma(0, block_tile0);
+    if (full_stages) {
+#pragma unroll
+      for (int stage = 1; stage < kTilesPerBlock; stage++) {
+        ::cuda::ptx::mbarrier_init(&barriers[stage], 1);
+        ::cuda::ptx::fence_proxy_async(::cuda::ptx::space_shared);
+        issue_tma(stage, block_tile0 + (stage << meta.box_shift[0]));
+      }
+    } else {
+#pragma unroll
+      for (int stage = 1; stage < kTilesPerBlock; stage++) {
+        if (stage < valid_stages) {
+          ::cuda::ptx::mbarrier_init(&barriers[stage], 1);
+          ::cuda::ptx::fence_proxy_async(::cuda::ptx::space_shared);
+          issue_tma(stage, block_tile0 + (stage << meta.box_shift[0]));
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  const int64_t base_output_offset =
+      static_cast<int64_t>(batch) * meta.output_batch_stride_bytes +
+      static_cast<int64_t>(block_tile0) *
+          meta.output_coord_stride_bytes[0] +
+      static_cast<int64_t>(block_tile1) *
+          meta.output_coord_stride_bytes[1];
+  char* output_block = data[0] + base_output_offset;
+  std::array<int, ninputs> zero_strides{};
+  auto consume_stage = [&](int stage) {
+    while (!::cuda::ptx::mbarrier_try_wait_parity(
+        ::cuda::ptx::sem_acquire,
+        ::cuda::ptx::scope_cta,
+        &barriers[stage],
+        0)) {
+    }
+
+    char* stage_smem = smem + meta.tile_smem_offset +
+        stage * meta.stage_smem_bytes;
+    char* output_stage = output_block +
+        static_cast<int64_t>(stage << meta.box_shift[0]) *
+            meta.output_coord_stride_bytes[0];
+    int warp_iteration =
+        (static_cast<int>(threadIdx.x) >> 5) * kElementsPerThread;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+#pragma unroll
+    for (int i = 0; i < kElementsPerThread; i++) {
+      int32_t local_coords[kVirtualRank];
+      decode_virtual_coords<max_input_element_size>(
+          warp_iteration, lane, local_coords);
+      std::array<char*, ninputs> input_ptrs;
+#pragma unroll
+      for (int input = 0; input < ninputs; input++) {
+        uint32_t byte_offset =
+            input_shared_offset<ninputs>(meta, input, local_coords);
+        input_ptrs[input] =
+            stage_smem + meta.smem_offsets[input] + byte_offset;
+      }
+      arg0_t result =
+          invoke(f, input_ptrs.data(), zero_strides.data(), 0);
+      const uint32_t output_offset =
+          static_cast<uint32_t>(local_coords[0]) *
+              static_cast<uint32_t>(meta.output_coord_stride_bytes[0]) +
+          static_cast<uint32_t>(local_coords[1]) *
+              static_cast<uint32_t>(meta.output_coord_stride_bytes[1]);
+      *reinterpret_cast<arg0_t*>(output_stage + output_offset) =
+          result;
+      warp_iteration++;
+    }
+  };
+
+  if (full_stages) {
+#pragma unroll
+    for (int stage = 0; stage < kTilesPerBlock; stage++) {
+      consume_stage(stage);
+    }
+  } else {
+#pragma unroll
+    for (int stage = 0; stage < kTilesPerBlock; stage++) {
+      if (stage < valid_stages) {
+        consume_stage(stage);
+      }
+    }
+  }
+#endif
+}
+
+template <int ninputs, int64_t max_input_element_size>
+static bool build_virtual_tma_metadata(
+    TensorIteratorBase& iter,
+    TmaElementwiseMeta<ninputs>& meta,
+    TmaElementwiseMaps<ninputs>& maps,
+    int& block_threads) {
+  auto shape = iter.shape();
+  const int ndim = iter.ndim();
+  if (ndim < kVirtualRank) {
+    return false;
+  }
+  for (const auto dim : c10::irange(ndim)) {
+    if (shape[dim] <= 0 ||
+        shape[dim] > std::numeric_limits<int32_t>::max()) {
+      return false;
+    }
+  }
+
+  c10::SmallVector<int32_t, 8> output_order;
+  auto output_strides = iter.strides(0);
+  int64_t output_element_size = iter.element_size(0);
+  if (!find_physical_dim_order(
+          output_strides, output_element_size, output_order)) {
+    return false;
+  }
+  c10::SmallVector<int32_t, 8> output_position(ndim);
+  for (const auto position : c10::irange(ndim)) {
+    output_position[output_order[position]] =
+        static_cast<int32_t>(position);
+  }
+
+  std::array<c10::SmallVector<int32_t, 8>, ninputs + 1> arg_orders;
+  for (int arg = 0; arg < iter.ntensors(); arg++) {
+    if (!is_aligned(iter.data_ptr(arg), 16)) {
+      return false;
+    }
+    int64_t element_size = iter.element_size(arg);
+    if (element_size != 1 && element_size != 2 && element_size != 4 &&
+        element_size != 8) {
+      return false;
+    }
+    auto strides = iter.strides(arg);
+    c10::SmallVector<int32_t, 8> dim_order;
+    if (!find_physical_dim_order(strides, element_size, dim_order)) {
+      return false;
+    }
+    arg_orders[arg].resize(ndim);
+    for (const auto position : c10::irange(ndim)) {
+      arg_orders[arg][position] =
+          output_position[dim_order[position]];
+    }
+  }
+
+  constexpr int64_t geometry_element_size = max_input_element_size;
+
+  int32_t box_shift;
+  if (geometry_element_size == 1) {
+    box_shift = 6;
+    block_threads = 512;
+  } else if (
+      geometry_element_size == 2 || geometry_element_size == 4) {
+    box_shift = 5;
+    block_threads = 128;
+  } else if (geometry_element_size == 8) {
+    box_shift = 4;
+    block_threads = 32;
+  } else {
+    return false;
+  }
+  const int32_t box = 1 << box_shift;
+  if (static_cast<int64_t>(box) * box !=
+      static_cast<int64_t>(block_threads) * kElementsPerThread) {
+    return false;
+  }
+
+  for (int a_end = 1; a_end < ndim; a_end++) {
+    for (int b_end = a_end + 1; b_end <= ndim; b_end++) {
+      c10::ArrayRef<int32_t> a_dims(output_order.data(), a_end);
+      c10::ArrayRef<int32_t> b_dims(
+          output_order.data() + a_end, b_end - a_end);
+      c10::ArrayRef<int32_t> c_dims(
+          output_order.data() + b_end, ndim - b_end);
+      std::array<bool, ninputs + 1> transposed{};
+      bool order_matches = true;
+
+      for (int arg = 0; arg < iter.ntensors(); arg++) {
+        bool identity = true;
+        bool swapped = true;
+        for (const auto position : c10::irange(ndim)) {
+          identity &=
+              arg_orders[arg][position] == static_cast<int32_t>(position);
+          int32_t expected;
+          if (position < b_end - a_end) {
+            expected = a_end + position;
+          } else if (position < b_end) {
+            expected = position - (b_end - a_end);
+          } else {
+            expected = position;
+          }
+          swapped &= arg_orders[arg][position] == expected;
+        }
+        if (arg == 0 ? !identity : (!identity && !swapped)) {
+          order_matches = false;
+          break;
+        }
+        transposed[arg] = !identity;
+      }
+      if (!order_matches) {
+        continue;
+      }
+
+      int64_t shape_a = shape_product(shape, a_dims);
+      int64_t shape_b = shape_product(shape, b_dims);
+      int64_t batch_count = shape_product(shape, c_dims);
+      if (shape_a == 0 || shape_b == 0 || batch_count == 0 ||
+          shape_a * batch_count >
+              std::numeric_limits<int32_t>::max() ||
+          shape_b * batch_count >
+              std::numeric_limits<int32_t>::max() ||
+          shape_a % box != 0 || shape_b % box != 0) {
+        continue;
+      }
+
+      bool dense = true;
+      for (int arg = 0; arg < iter.ntensors(); arg++) {
+        auto strides = iter.strides(arg);
+        c10::ArrayRef<int32_t> first =
+            transposed[arg] ? b_dims : a_dims;
+        c10::ArrayRef<int32_t> second =
+            transposed[arg] ? a_dims : b_dims;
+        c10::SmallVector<int32_t, 8> second_and_batch(
+            second.begin(), second.end());
+        second_and_batch.append(c_dims.begin(), c_dims.end());
+        if (!is_dense_run(shape, strides, first) ||
+            !is_dense_run(shape, strides, second_and_batch)) {
+          dense = false;
+          break;
+        }
+      }
+      if (!dense) {
+        continue;
+      }
+
+      TmaElementwiseMeta<ninputs> candidate_meta{};
+      TmaElementwiseMaps<ninputs> candidate_maps{};
+      candidate_meta.virtual_shape[0] = static_cast<int32_t>(shape_a);
+      candidate_meta.virtual_shape[1] = static_cast<int32_t>(shape_b);
+      candidate_meta.batch_count = static_cast<int32_t>(batch_count);
+      candidate_meta.box_shift[0] = box_shift;
+      candidate_meta.box_shift[1] = box_shift;
+      candidate_meta.tiles_per_dim[0] =
+          static_cast<int32_t>(shape_a / box);
+      candidate_meta.tiles_per_dim[1] =
+          static_cast<int32_t>(shape_b / box);
+
+      int64_t grid_x =
+          (candidate_meta.tiles_per_dim[0] + kTilesPerBlock - 1) /
+          kTilesPerBlock;
+      if (grid_x <= 0 ||
+          grid_x > std::numeric_limits<int32_t>::max()) {
+        continue;
+      }
+
+      int64_t output_stride_a = output_strides[a_dims.front()];
+      int64_t output_stride_b = output_strides[b_dims.front()];
+      int64_t output_batch_stride =
+          c_dims.empty() ? 0 : output_strides[c_dims.front()];
+      int64_t max_output_local_offset =
+          (box - 1) * output_stride_a + (box - 1) * output_stride_b;
+      if (output_stride_a > std::numeric_limits<int32_t>::max() ||
+          output_stride_b > std::numeric_limits<int32_t>::max() ||
+          output_batch_stride > std::numeric_limits<int32_t>::max() ||
+          output_stride_b % 16 != 0 ||
+          (output_batch_stride != 0 && output_batch_stride % 16 != 0) ||
+          max_output_local_offset >
+              std::numeric_limits<uint32_t>::max() ||
+          shape_a * output_element_size % 16 != 0) {
+        continue;
+      }
+      candidate_meta.output_coord_stride_bytes[0] =
+          static_cast<int32_t>(output_stride_a);
+      candidate_meta.output_coord_stride_bytes[1] =
+          static_cast<int32_t>(output_stride_b);
+      candidate_meta.output_batch_stride_bytes =
+          static_cast<int32_t>(output_batch_stride);
+
+      std::array<int32_t, ninputs> input_element_size{};
+      std::array<int32_t, ninputs> input_row_stride_bytes{};
+      bool descriptors_valid = true;
+      int64_t smem_offset = 0;
+      int64_t total_tma_bytes = 0;
+      for (int input = 0; input < ninputs; input++) {
+        int arg = input + 1;
+        int64_t element_size = iter.element_size(arg);
+        input_element_size[input] = static_cast<int32_t>(element_size);
+        bool input_transposed = transposed[arg];
+        candidate_meta.input_transposed[input] = input_transposed;
+        int64_t fast_extent =
+            (input_transposed ? shape_b : shape_a) * element_size;
+        int64_t inner_bytes = static_cast<int64_t>(box) * element_size;
+        if (fast_extent % 16 != 0 || inner_bytes > 128) {
+          descriptors_valid = false;
+          break;
+        }
+        if (!input_transposed) {
+          candidate_meta.swizzle_bytes[input] = 0;
+        } else if (inner_bytes <= 32) {
+          candidate_meta.swizzle_bytes[input] = 32;
+        } else if (inner_bytes <= 64) {
+          candidate_meta.swizzle_bytes[input] = 64;
+        } else {
+          candidate_meta.swizzle_bytes[input] = 128;
+        }
+        if (candidate_meta.swizzle_bytes[input] != 0 &&
+            !is_aligned(iter.data_ptr(arg), 128)) {
+          descriptors_valid = false;
+          break;
+        }
+        candidate_meta.swizzle_masks[input] =
+            candidate_meta.swizzle_bytes[input] == 0
+            ? 0
+            : (candidate_meta.swizzle_bytes[input] - 16) << 3;
+        input_row_stride_bytes[input] =
+            candidate_meta.swizzle_bytes[input] == 0
+            ? static_cast<int32_t>(inner_bytes)
+            : candidate_meta.swizzle_bytes[input];
+        if (input_transposed) {
+          candidate_meta.input_coord_stride_bytes[
+              input * kVirtualRank] = input_row_stride_bytes[input];
+          candidate_meta.input_coord_stride_bytes[
+              input * kVirtualRank + 1] =
+              static_cast<int32_t>(element_size);
+        } else {
+          candidate_meta.input_coord_stride_bytes[
+              input * kVirtualRank] =
+              static_cast<int32_t>(element_size);
+          candidate_meta.input_coord_stride_bytes[
+              input * kVirtualRank + 1] = input_row_stride_bytes[input];
+        }
+
+        smem_offset = align_up(smem_offset, kSmemAlignment);
+        candidate_meta.smem_offsets[input] =
+            static_cast<int32_t>(smem_offset);
+        smem_offset +=
+            static_cast<int64_t>(input_row_stride_bytes[input]) * box;
+        total_tma_bytes +=
+            static_cast<int64_t>(box) * box * element_size;
+      }
+      if (!descriptors_valid) {
+        continue;
+      }
+
+      candidate_meta.tile_smem_offset = static_cast<int32_t>(
+          align_up(
+              kTilesPerBlock * static_cast<int64_t>(sizeof(uint64_t)),
+              kSmemAlignment));
+      candidate_meta.stage_smem_bytes =
+          static_cast<int32_t>(align_up(smem_offset, kSmemAlignment));
+      candidate_meta.total_tma_bytes =
+          static_cast<int32_t>(total_tma_bytes);
+      int64_t smem_bytes =
+          candidate_meta.tile_smem_offset +
+          kTilesPerBlock *
+              static_cast<int64_t>(candidate_meta.stage_smem_bytes) +
+          kSmemAlignment;
+      if (smem_bytes > std::numeric_limits<int32_t>::max()) {
+        continue;
+      }
+      candidate_meta.smem_bytes = static_cast<int32_t>(smem_bytes);
+
+      constexpr cuuint32_t element_strides[kVirtualRank] = {1, 1};
+      for (int input = 0; input < ninputs; input++) {
+        int arg = input + 1;
+        CUtensorMapDataType data_type;
+        if (!tensor_map_data_type(
+                input_element_size[input], &data_type)) {
+          descriptors_valid = false;
+          break;
+        }
+        bool input_transposed =
+            candidate_meta.input_transposed[input] != 0;
+        c10::ArrayRef<int32_t> second =
+            input_transposed ? a_dims : b_dims;
+        int64_t second_stride = iter.strides(arg)[second.front()];
+        int64_t second_extent =
+            (input_transposed ? shape_a : shape_b) * batch_count;
+        if (second_stride % 16 != 0 ||
+            second_stride >= (1LL << 40)) {
+          descriptors_valid = false;
+          break;
+        }
+        cuuint64_t global_dim[kVirtualRank] = {
+            static_cast<cuuint64_t>(
+                input_transposed ? shape_b : shape_a),
+            static_cast<cuuint64_t>(second_extent)};
+        cuuint64_t global_strides[kVirtualRank - 1] = {
+            static_cast<cuuint64_t>(second_stride)};
+        cuuint32_t box_dim[kVirtualRank] = {
+            static_cast<cuuint32_t>(box),
+            static_cast<cuuint32_t>(box)};
+        CUresult result =
+            at::globalContext().getNVRTC().cuTensorMapEncodeTiled(
+                &candidate_maps.maps[input],
+                data_type,
+                kVirtualRank,
+                iter.data_ptr(arg),
+                global_dim,
+                global_strides,
+                box_dim,
+                element_strides,
+                CU_TENSOR_MAP_INTERLEAVE_NONE,
+                tensor_map_swizzle(
+                    candidate_meta.swizzle_bytes[input]),
+                CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+                CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+        if (result != CUDA_SUCCESS) {
+          descriptors_valid = false;
+          break;
+        }
+      }
+      if (descriptors_valid) {
+        meta = candidate_meta;
+        maps = candidate_maps;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+template <typename func_t, typename array_t>
+static bool launch_virtual_tma_elementwise_kernel(
+    TensorIteratorBase& iter,
+    const func_t& f,
+    array_t data) {
+  using traits = function_traits<func_t>;
+  constexpr int ninputs = traits::arity;
+  constexpr int64_t max_input_element_size =
+      max_arg_element_size_impl<traits, ninputs>::value;
+  if constexpr (
+      ninputs == 0 ||
+      (max_input_element_size != 1 &&
+       max_input_element_size != 2 &&
+       max_input_element_size != 4 &&
+       max_input_element_size != 8)) {
+    return false;
+  } else {
+    auto stream = at::cuda::getCurrentCUDAStream();
+    cudaDeviceProp* prop =
+        at::cuda::getDeviceProperties(stream.device().index());
+    if (prop->major != 10 || prop->minor != 7) {
+      return false;
+    }
+    static const bool disabled = c10::utils::check_env(
+        "PYTORCH_TMA_ELEMENTWISE_DISABLE").value_or(false);
+    if (disabled) {
+      return false;
+    }
+    auto kernel = tma_elementwise_kernel<func_t, array_t, ninputs>;
+    cudaFuncAttributes attributes{};
+    AT_CUDA_CHECK(cudaFuncGetAttributes(&attributes, kernel));
+    if (attributes.ptxVersion < 90) {
+      return false;
+    }
+
+    TmaElementwiseMeta<ninputs> meta{};
+    TmaElementwiseMaps<ninputs> maps{};
+    int block_threads = 0;
+    if (!build_virtual_tma_metadata<
+            ninputs,
+            max_input_element_size>(iter, meta, maps, block_threads)) {
+      return false;
+    }
+    if (block_threads > kMaxThreadsPerBlock ||
+        static_cast<size_t>(meta.smem_bytes) >
+            prop->sharedMemPerBlockOptin) {
+      return false;
+    }
+
+    if (meta.smem_bytes > 0xc000) {
+      AT_CUDA_CHECK(cudaFuncSetAttribute(
+          kernel,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          meta.smem_bytes));
+    }
+
+    int grid_x =
+        (meta.tiles_per_dim[0] + kTilesPerBlock - 1) /
+        kTilesPerBlock;
+    int grid_y = meta.tiles_per_dim[1];
+    int grid_z = meta.batch_count;
+    if (grid_x > prop->maxGridSize[0] ||
+        grid_y > prop->maxGridSize[1] ||
+        grid_z > prop->maxGridSize[2]) {
+      return false;
+    }
+
+    dim3 grid(grid_x, grid_y, grid_z);
+    kernel<<<grid, block_threads, meta.smem_bytes, stream>>>(
+        f, data, maps, meta);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return true;
+  }
+}
+
+template <typename func_t, typename array_t>
+static bool launch_tma_elementwise_kernel(
+    TensorIteratorBase& iter,
+    const func_t& f,
+    array_t data) {
+  using traits = function_traits<func_t>;
+  constexpr int ninputs = traits::arity;
+  if (iter.ndim() < kVirtualRank ||
+      !iter.can_use_32bit_indexing() ||
+      iter.noutputs() != 1 || iter.ninputs() != ninputs ||
+      iter.element_size(0) != sizeof(typename traits::result_type)) {
+    return false;
+  }
+  return launch_virtual_tma_elementwise_kernel(iter, f, data);
+}
+
+} // namespace tma_elementwise
+#endif
+
 #ifdef USE_ROCM
 template <int nt, int vt, typename func_t>
 C10_LAUNCH_BOUNDS_2(nt, 4)
@@ -660,7 +1469,7 @@ C10_HOST_DEVICE typename traits::result_type invoke_impl(
 template <
     typename func_t,
     typename index_t,
-    typename traits = function_traits<func_t>>
+    typename traits>
 C10_HOST_DEVICE typename traits::result_type invoke(
     const func_t& f,
     char* const C10_RESTRICT data[],
@@ -687,7 +1496,7 @@ C10_HOST_DEVICE typename traits::result_type invoke_impl(
 template <
     typename func_t,
     typename index_t,
-    typename traits = function_traits<func_t>>
+    typename traits>
 C10_HOST_DEVICE typename traits::result_type invoke(
     const func_t& f,
     char* const C10_RESTRICT data[],
@@ -720,6 +1529,11 @@ void gpu_kernel_impl_nocast(TensorIteratorBase& iter, const func_t& f) {
   if (contiguous) {
     return launch_vectorized_kernel(numel, f, data);
   }
+#if AT_CUDA_TMA_ELEMENTWISE_ENABLED
+  if (tma_elementwise::launch_tma_elementwise_kernel(iter, f, data)) {
+    return;
+  }
+#endif
   auto offset_calc = ::make_offset_calculator<traits::arity + 1>(iter);
 #ifndef USE_ROCM
   constexpr int unroll_factor = sizeof(arg0_t) >= 4 ? 2 : 4;

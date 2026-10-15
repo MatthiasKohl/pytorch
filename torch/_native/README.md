@@ -389,6 +389,23 @@ def example_ordering_fn(op_symbol, dispatch_key, nodes):
     return out_nodes
 ```
 
+# Rubin pointwise tuning
+
+On CUDA devices with compute capability 10.7, eligible pointwise calls use the
+Rubin vector or six-stage TMA kernels. Other dtype, broadcasting, alignment, and
+layout combinations retain the generic CuTeDSL or ATen route. CPU scalar operands
+remain runtime values and do not count toward the vector input traffic.
+
+Set `TORCH_NATIVE_CUTEDSL_POINTWISE_TUNING=0` before importing torch to compare
+against the generic CuTeDSL implementation. Use
+`torch.backends.python_native.cutedsl.disabled()` for an ATen reference.
+Pointwise kernels currently use JIT compilation and the shared native plan cache;
+this family has no embedded native-AOT declarations yet.
+
+Eligible native ATen fallback calls also retain the Rubin six-stage TMA path.
+Set `PYTORCH_TMA_ELEMENTWISE_DISABLE=1` before importing torch to compare against
+the upstream ATen offset kernel. Disabling CuTeDSL alone leaves native TMA enabled.
+
 # Logging
 
 All modules under `torch._native` route through Python's standard `logging` and are wired into `TORCH_LOGS` under the `native_dsl` shorthand. Use it to surface registration-time diagnostics (missing optional deps, version mismatches, DSL availability checks) without spamming stderr on stock `import torch`.
