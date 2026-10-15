@@ -26,6 +26,7 @@
 
 import math
 import os
+from collections.abc import Sequence
 from typing import Any, NamedTuple
 
 import cuda.bindings.driver as cuda
@@ -982,15 +983,20 @@ class _TunedTmaConfig(NamedTuple):
 
 class _TunedPlan(NamedTuple):
     config: _TunedVectorConfig | _TunedTmaConfig
-    fn: object
+    fn: Any
 
 
-def _pointer(t):
+def _pointer(t: torch.Tensor) -> int:
     with torch._C.DisableTorchFunctionSubclass():
         return t.const_data_ptr()
 
 
-def _vector_config(inputs, shape, output_address, out_dtype=None):
+def _vector_config(
+    inputs: Sequence[torch.Tensor],
+    shape: tuple[int, ...],
+    output_address: int,
+    out_dtype: torch.dtype | None = None,
+) -> _TunedVectorConfig | None:
     if not inputs or any(
         tuple(t.shape) != shape or not t.is_contiguous() for t in inputs
     ):
@@ -1025,7 +1031,7 @@ def _vector_config(inputs, shape, output_address, out_dtype=None):
     return _TunedVectorConfig("vector", vec, thread_work // vec)
 
 
-def _tma_geometry(element_bytes):
+def _tma_geometry(element_bytes: int) -> tuple[int, int] | None:
     if element_bytes == 1:
         return 64, 512
     if element_bytes in (2, 4):
@@ -1035,7 +1041,7 @@ def _tma_geometry(element_bytes):
     return None
 
 
-def _physical_dim_order(strides):
+def _physical_dim_order(strides: tuple[int, ...]) -> tuple[int, ...] | None:
     if not strides or any(stride <= 0 for stride in strides):
         return None
     order = tuple(sorted(range(len(strides)), key=strides.__getitem__))
@@ -1046,14 +1052,16 @@ def _physical_dim_order(strides):
     return order
 
 
-def _dense_run(shape, strides, dims):
+def _dense_run(
+    shape: tuple[int, ...], strides: tuple[int, ...], dims: tuple[int, ...]
+) -> bool:
     return all(
         shape[dims[i - 1]] * strides[dims[i - 1]] == strides[dims[i]]
         for i in range(1, len(dims))
     )
 
 
-def _contiguous_strides(shape):
+def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
     strides = [0] * len(shape)
     stride = 1
     for dim in range(len(shape) - 1, -1, -1):
@@ -1062,7 +1070,11 @@ def _contiguous_strides(shape):
     return tuple(strides)
 
 
-def _tma2d_config(inputs, shape, output_address):
+def _tma2d_config(
+    inputs: Sequence[torch.Tensor],
+    shape: tuple[int, ...],
+    output_address: int,
+) -> _TunedTmaConfig | None:
     if len(shape) < 2 or not inputs:
         return None
     dtype = inputs[0].dtype
@@ -1199,7 +1211,13 @@ def _tma2d_config(inputs, shape, output_address):
     return None
 
 
-def _select_config(inputs, shape, output_address, out_dtype, allow_tma=True):
+def _select_config(
+    inputs: Sequence[torch.Tensor],
+    shape: tuple[int, ...],
+    output_address: int,
+    out_dtype: torch.dtype,
+    allow_tma: bool = True,
+) -> _TunedVectorConfig | _TunedTmaConfig | None:
     if allow_tma:
         config = _tma2d_config(inputs, shape, output_address)
         if config is not None:
@@ -1207,7 +1225,13 @@ def _select_config(inputs, shape, output_address, out_dtype, allow_tma=True):
     return _vector_config(inputs, shape, output_address, out_dtype)
 
 
-def can_run_tuned(inputs, shape, out_dtype, target=None, allow_tma=True):
+def can_run_tuned(
+    inputs: Sequence[torch.Tensor],
+    shape: Sequence[int],
+    out_dtype: torch.dtype,
+    target: torch.Tensor | None = None,
+    allow_tma: bool = True,
+) -> bool:
     if not _TUNING_ENABLED or not inputs:
         return False
     tensors = inputs
@@ -1260,7 +1284,7 @@ def can_run_tuned(inputs, shape, out_dtype, target=None, allow_tma=True):
     )
 
 
-def _tma_smem_layout(dtype, box, transposed):
+def _tma_smem_layout(dtype: Any, box: int, transposed: bool) -> Any:
     inner_bytes = box * dtype.width // 8
     if not transposed:
         swizzle_bits = 0
@@ -1284,7 +1308,16 @@ def _tma_smem_layout(dtype, box, transposed):
 
 
 class _ElementwiseTma2D:
-    def __init__(self, fn, ninputs, nconsts, compute, out_type, in_dtype, config):
+    def __init__(
+        self,
+        fn: Any,
+        ninputs: int,
+        nconsts: int,
+        compute: Any,
+        out_type: Any,
+        in_dtype: Any,
+        config: _TunedTmaConfig,
+    ) -> None:
         self.fn = fn
         self.ninputs = ninputs
         self.nconsts = nconsts
@@ -1438,14 +1471,23 @@ class _ElementwiseTma2D:
                     )
 
 
-def _fake_tensor(dtype, view, align):
+def _fake_tensor(
+    dtype: Any, view: tuple[tuple[int, ...], tuple[int, ...]], align: int
+) -> Any:
     shape, stride = view
     return cute.runtime.make_fake_tensor(
         dtype, tuple(shape), stride=tuple(stride), assumed_align=align
     )
 
 
-def _compile_tuned_plan(fn, key, inputs, out, consts, compute):
+def _compile_tuned_plan(
+    fn: Any,
+    key: tuple[Any, ...],
+    inputs: Sequence[torch.Tensor],
+    out: torch.Tensor,
+    consts: Sequence[Any],
+    compute: type[cutlass.Numeric],
+) -> _TunedPlan:
     config = _select_config(inputs, tuple(out.shape), _pointer(out), out.dtype)
     if config is None:
         raise AssertionError("pointwise override selected an unsupported launch")
@@ -1514,7 +1556,14 @@ def _compile_tuned_plan(fn, key, inputs, out, consts, compute):
     return _TunedPlan(config, compiled)
 
 
-def _try_run_tuned(fn, key, inputs, out, consts, compute):
+def _try_run_tuned(
+    fn: Any,
+    key: tuple[Any, ...],
+    inputs: Sequence[torch.Tensor],
+    out: torch.Tensor,
+    consts: Sequence[Any],
+    compute: type[cutlass.Numeric],
+) -> bool:
     if len(consts) > _CONST_SLOTS or not can_run_tuned(
         inputs, out.shape, out.dtype, out
     ):

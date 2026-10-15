@@ -30,6 +30,7 @@ replay, so the kernel must LOAD them from device memory instead of baking them.
 
 import functools
 import struct
+from typing import Any
 
 import torch
 
@@ -47,7 +48,7 @@ _ITER_UNROLL = 4
 _ITER_UNROLL_CANDIDATES = (1, 2, 4, 8)
 
 
-def choose_iter_unroll(hw=None) -> int:
+def choose_iter_unroll(hw: Any = None) -> int:
     """Unroll depth for the hybrid grid-stride loop.
 
     B200, fp32 normal_ (cold compile, then us at 2^24 / 2^26 / 2^28):
@@ -94,7 +95,9 @@ def f32(x: float) -> float:
     return struct.unpack("f", struct.pack("f", x))[0]
 
 
-def philox_args(device_index: int, counter_offset: int):
+def philox_args(
+    device_index: int, counter_offset: int
+) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Reserve counter_offset from the device's default generator.
 
     Returns (seed_t, offset_t, intragraph). seed_t/offset_t are CPU tensors in eager
@@ -103,7 +106,7 @@ def philox_args(device_index: int, counter_offset: int):
     """
     gen = torch.cuda.default_generators[device_index]
     seed_t, offset_t, intra_t = gen.philox_state(counter_offset)
-    return seed_t, offset_t, intra_t.item()
+    return seed_t, offset_t, int(intra_t.item())
 
 
 @functools.cache

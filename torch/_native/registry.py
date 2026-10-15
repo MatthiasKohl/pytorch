@@ -3,7 +3,7 @@ import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from functools import cache
-from typing import ParamSpec, TypeVar
+from typing import Any, ParamSpec, TypeVar
 
 import torch.library
 
@@ -443,7 +443,7 @@ def _same_dtype_kind(a: torch.dtype, b: torch.dtype) -> bool:
     return kind(a) == kind(b)
 
 
-def _cast_to_weak_dtype(out, cast_dtype):
+def _cast_to_weak_dtype(out: Any, cast_dtype: torch.dtype | None) -> Any:
     """Cast a result down to aten's weak-promotion dtype, or return it unchanged.
 
     The natural-precision scalar wrap in _scalar_arg_coercer can OVER-PROMOTE against
@@ -483,7 +483,11 @@ _NATURAL_SCALAR_DTYPE: dict[type, torch.dtype] = {
 }
 
 
-def _weak_wrap(num, tensor_dtypes: list[torch.dtype], cast_dtype: torch.dtype):
+def _weak_wrap(
+    num: bool | int | float | complex,
+    tensor_dtypes: list[torch.dtype],
+    cast_dtype: torch.dtype,
+) -> torch.Tensor:
     """Wrap a Python number as a 0-d tensor, at natural precision where aten can
     promote it and at ``cast_dtype`` where it cannot.
 
@@ -511,7 +515,9 @@ def _weak_wrap(num, tensor_dtypes: list[torch.dtype], cast_dtype: torch.dtype):
     return narrowed if narrowed.to(nat.dtype).equal(nat) else nat
 
 
-def _scalar_arg_coercer(overload: "torch._ops.OpOverload | None"):
+def _scalar_arg_coercer(
+    overload: "torch._ops.OpOverload | None",
+) -> Callable[[tuple[Any, ...]], tuple[tuple[Any, ...], torch.dtype | None]] | None:
     """Build a fn ``args -> (coerced_args, cast_dtype)`` that wraps Python-number args
     sitting in Tensor-typed positional slots into 0-d tensors, or None if the op has no
     such slots. ``cast_dtype`` is aten's weak-promotion result dtype; the caller casts
@@ -550,7 +556,7 @@ def _scalar_arg_coercer(overload: "torch._ops.OpOverload | None"):
     if not tensor_slots:
         return None
 
-    def coerce(args):
+    def coerce(args: tuple[Any, ...]) -> tuple[tuple[Any, ...], torch.dtype | None]:
         scalar_slots = [
             i
             for i in tensor_slots
