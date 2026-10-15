@@ -253,18 +253,28 @@ void histogramdd_out_cuda_template(
           (num_samples - 1) / histogram_threads + 1, properties->multiProcessorCount * histogram_blocks_per_sm));
       const auto stream = at::cuda::getCurrentCUDAStream();
       const auto shared_bytes = histogram.numel() * sizeof(scalar_t);
+      size_t shared_limit = properties->sharedMemPerBlock;
+#if !defined(USE_ROCM)
+      int reserved_shared_bytes = 0;
+      C10_CUDA_CHECK(cudaDeviceGetAttribute(
+          &reserved_shared_bytes, cudaDevAttrReservedSharedMemoryPerBlock, self.get_device()));
+      shared_limit = std::min<size_t>(
+          properties->sharedMemPerBlockOptin,
+          properties->sharedMemPerMultiprocessor / histogram_blocks_per_sm - reserved_shared_bytes);
+#endif
       const size_t replica_budget = std::min<size_t>(
-          properties->sharedMemPerBlock,
+          shared_limit,
           properties->sharedMemPerMultiprocessor / histogram_blocks_per_sm);
+      const int64_t samples_per_block = (num_samples - 1) / blocks + 1;
       int replicas = 1;
       while (replicas * 2 <= histogram_threads / properties->warpSize &&
-             shared_bytes * replicas * 2 <= replica_budget) {
+             shared_bytes * replicas * 2 <= replica_budget &&
+             (histogram.numel() * replicas * 2 - 1) / histogram_shared_bins_per_sample < samples_per_block) {
         replicas *= 2;
       }
       // Amortize shared histogram initialization and merging over the samples,
       // including the replicas. Keep the regular grid to preserve parallelism.
-      const int64_t samples_per_block = (num_samples - 1) / blocks + 1;
-      const bool use_shared = shared_bytes <= properties->sharedMemPerBlock &&
+      const bool use_shared = shared_bytes * replicas <= shared_limit &&
           (histogram.numel() * replicas - 1) / histogram_shared_bins_per_sample < samples_per_block;
       const scalar_t* weight_data = weights.defined() ? weights.const_data_ptr<scalar_t>() : nullptr;
       const int64_t weight_stride = weights.defined() ? weights.stride(0) : 0;
@@ -281,11 +291,17 @@ void histogramdd_out_cuda_template(
             edge_data = edges.const_data_ptr<scalar_t>();
           }
           if (use_shared) {
-            histogramdd_cuda_kernel<scalar_t, index_t, linear_bins, one_dimensional, inline_bin_edges, weighted, true>
-                <<<blocks, histogram_threads, shared_bytes * replicas, stream>>>(
-                    input.const_data_ptr<scalar_t>(), num_samples, dimensions, input.stride(0), input.stride(1),
-                    weight_data, weight_stride, edge_data, offsets,
-                    histogram.mutable_data_ptr<scalar_t>(), histogram.numel(), replicas);
+            auto kernel = histogramdd_cuda_kernel<scalar_t, index_t, linear_bins, one_dimensional, inline_bin_edges, weighted, true>;
+#if !defined(USE_ROCM)
+            if (shared_bytes * replicas > properties->sharedMemPerBlock) {
+              C10_CUDA_CHECK(cudaFuncSetAttribute(
+                  kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared_limit)));
+            }
+#endif
+            kernel<<<blocks, histogram_threads, shared_bytes * replicas, stream>>>(
+                input.const_data_ptr<scalar_t>(), num_samples, dimensions, input.stride(0), input.stride(1),
+                weight_data, weight_stride, edge_data, offsets,
+                histogram.mutable_data_ptr<scalar_t>(), histogram.numel(), replicas);
           } else {
             histogramdd_cuda_kernel<scalar_t, index_t, linear_bins, one_dimensional, inline_bin_edges, weighted, false>
                 <<<blocks, histogram_threads, 0, stream>>>(
