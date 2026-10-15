@@ -73,8 +73,8 @@ def _layouts_serveable(ins) -> bool:
     gaps = {K._row_gap_view(t) for t in ins if not t.is_contiguous()}
     if not gaps:
         return True  # all contiguous
-    if len(gaps) > 1:
-        return False  # two different gap geometries -> strided-slow -> decline
+    if None in gaps or len(gaps) > 1:
+        return False  # unsupported or mixed gap geometries -> decline
     # One gap geometry: every operand must share it (a contiguous operand of the same
     # shape has a DIFFERENT (row_step == run) geometry -> mixed -> strided -> decline).
     return all(K._row_gap_view(t) in gaps for t in ins)
@@ -105,7 +105,7 @@ def _localize_scalars(ins):
     return tuple(t.to(ref.device) if _is_wrapped_scalar(t) else t for t in ins)
 
 
-def _supported(t, dtypes) -> bool:
+def _supported(t, dtypes, allow_tma=False) -> bool:
     # COW is not gated: inputs export read-only (launch._ro / ReadOnlyTensorWrapper),
     # so a COW input flows through the kernel without materializing.
     #
@@ -118,7 +118,7 @@ def _supported(t, dtypes) -> bool:
     return (
         isinstance(t, torch.Tensor)
         and t.dtype in dtypes
-        and _layout_ok(t)
+        and (allow_tma or _layout_ok(t))
         and t.numel() > 0
         and not t.is_neg()
         and not t.is_conj()
@@ -261,7 +261,9 @@ def _make_cond(row: PointwiseDef, variant):
 
     def cond(*args, **kwargs):
         ins = args[: row.nin]
-        if len(ins) < row.nin or not all(_supported(t, dtypes) for t in ins):
+        if len(ins) < row.nin or not all(
+            _supported(t, dtypes, allow_tma=True) for t in ins
+        ):
             return False
         # The DEVICE reference must be a real device operand, not simply operand 0. aten
         # puts the coerced scalar FIRST for the reflected overloads -- rsub.Scalar is
@@ -291,8 +293,6 @@ def _make_cond(row: PointwiseDef, variant):
         # and still declines.
         if any(t.device != ref.device and not _is_wrapped_scalar(t) for t in ins):
             return False
-        if not _layouts_serveable(ins):
-            return False  # gapped operand set the rowvec path can't serve -> aten
         try:
             bshape = torch.broadcast_shapes(*(t.shape for t in ins))
         except RuntimeError:
@@ -302,7 +302,14 @@ def _make_cond(row: PointwiseDef, variant):
         if not can_use_32bit_index_math(tensors, bshape):
             return False
         _, result_dtype = _result_dtypes(row, _promo_key(ins), promotion)
-        if result_dtype not in _KERNEL_DTYPES:
+        out_dtype = tgt.dtype if isinstance(tgt, torch.Tensor) else result_dtype
+        tuned_required = out_dtype == torch.bool or not _layouts_serveable(ins)
+        if tuned_required:
+            if row.nout != 1 or not K.can_run_tuned(
+                ins, bshape, out_dtype, tgt, allow_tma=variant.out_from != "self"
+            ):
+                return False
+        elif result_dtype not in _KERNEL_DTYPES:
             return False
         # The row's own aten meta precondition (a shared-dtype requirement rather than
         # promotion -- heaviside, lerp.Tensor). False means aten RAISES, so decline and
@@ -333,7 +340,7 @@ def _make_cond(row: PointwiseDef, variant):
             # out=c128)` reached _build_plan and raised KeyError('torch.complex128').
             # (_CONV_SRC_DTYPES, not _CONV_DTYPES: bool is a legitimate .out target for
             # the comparison rows, which store a bool result.)
-            if tgt.dtype not in _CONV_SRC_DTYPES:
+            if tgt.dtype not in (*_CONV_SRC_DTYPES, torch.bool):
                 return False
             # Safe-cast gate: promotion result must fit the target dtype (else aten raises).
             _, result_dtype = _result_dtypes(row, _promo_key(ins), promotion)
