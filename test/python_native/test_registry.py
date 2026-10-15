@@ -7,7 +7,13 @@ import torch
 import torch._dynamo.trace_rules as trace_rules
 import torch._native.registry as registry_module
 from torch._subclasses.fake_tensor import FakeTensorMode
-from torch.testing._internal.common_utils import run_tests, skipIfTorchDynamo, TestCase
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+    skipIfTorchDynamo,
+    TestCase,
+)
 
 
 class _CowStateWrapperTensor(torch.Tensor):
@@ -743,6 +749,43 @@ class TestRegistryRuntime(TestCase):
         self.assertFalse(fn(torch.tensor([2.0, 3.0])))
         self.assertTrue(fn(torch._lazy_clone(torch.tensor([2.0, 3.0]))))
 
+    @parametrize(
+        "dtype,scalar,shape",
+        [
+            (torch.float32, 2.0, (2,)),
+            (torch.float64, 2.0, (2,)),
+            (torch.float32, 2.0, ()),
+            (torch.float64, 2.0, ()),
+            (torch.int32, 2, ()),
+            (torch.int32, 0.5, ()),
+            (torch.int32, 0.5, (2,)),
+            (torch.float32, 0.5j, (2,)),
+        ],
+    )
+    def test_dynamo_shortcut_preserves_scalar_cow_fallback(
+        self, dtype: torch.dtype, scalar: int | float | complex, shape: tuple[int, ...]
+    ) -> None:
+        values = torch.tensor([2, 3] if shape else 3, dtype=dtype)
+        expected = torch.mul(values, scalar)
+        self.registry.register_op_override(
+            "test_dsl",
+            "aten",
+            "mul.Tensor",
+            "CPU",
+            lambda *args, **kwargs: False,
+            lambda a, b: None,
+        )
+        self._install("mul.Tensor", "CPU")
+
+        @torch.compile(backend="eager")
+        def fn(a: torch.Tensor) -> torch.Tensor:
+            with torch.device("cpu"):
+                return torch.mul(a, scalar)
+
+        a = torch._lazy_clone(values)
+        self.assertEqual(fn(a), expected)
+        self.assertTrue(torch._C._is_cow_tensor(a))
+
     def test_dynamo_graph_breaks_on_sourceless_cow_state(self):
         @torch.compile(backend="eager")
         def fn(a):
@@ -1392,6 +1435,8 @@ class TestRegistryNonAtenNamespace(TestCase):
         with self.assertRaisesRegex(AttributeError, "not found; is the namespace"):
             self._install(self.MISSING_NS)
 
+
+instantiate_parametrized_tests(TestRegistryRuntime)
 
 if __name__ == "__main__":
     run_tests()
