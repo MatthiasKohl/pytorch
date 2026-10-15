@@ -36,9 +36,10 @@ from cutlass.cute.nvgpu import cpasync
 
 import torch
 
+from ...cutedsl import hw_caps as _hw, launch as _L
 from ...cutedsl.dtypes import torch2cute
-from .._cutedsl import hw_caps as _hw, launch as _L
-from .._cutedsl.plan_cache import cached_plan
+from ...cutedsl.plan_cache import cached_plan
+from .indexing import can_use_32bit_index_math
 
 
 # Exposed perf knobs (autotunable). run() fills any knob left None from _choose_config
@@ -118,7 +119,7 @@ def _choose_config(numel: int, compute_bits: int, hw=None, nin=1) -> "_Pointwise
     # at-scale) move with the shape; both thresholds scale by hw.fill_scale so a larger
     # GPU coarsens at a proportionally larger numel and a smaller one sooner (fill_scale
     # is 1.0 on B200 -> the anchor numbers reproduce exactly).
-    fill = 1.0 if hw is None else hw.fill_scale
+    fill = 1.0 if hw is None else hw.sm_count * hw.max_threads_per_sm / (148 * 2048)
     norm = numel // max(compute_bits // 16, 1)  # dtype-normalized element count
     ept = next(e for thresh, e in _EPT_SCHEDULE if norm >= thresh * fill)
     # The 256b widening was measured on ops that READ memory, where the extra width buys
@@ -604,7 +605,9 @@ def _fake_vec(t, V, dyn):
     # 16-byte alignment: torch allocations are >=256 B aligned and V*itemsize == 128 bits, so the
     # wide load is safe. `dyn` leaves the vector COUNT symbolic, so one kernel serves every numel.
     lead = _L.sym() if dyn else t.numel() // V
-    return _L.fake_compact(torch2cute[t.dtype], (lead, V), order=(1, 0), align=16)
+    return _L.fake_compact(
+        torch2cute[t.dtype], (lead, V), stride_order=(1, 0), align=16
+    )
 
 
 def _view_rowvec(t, rows, run, row_step, V):
@@ -616,18 +619,20 @@ def _view_rowvec(t, rows, run, row_step, V):
 def _fake_rowvec(t, rows, run, row_step, V):
     # Extents and pitch are STATIC here: the plan key carries (rows, run, row_step), so a different
     # gap geometry is a different kernel either way.
-    return _L.fake_strided(
+    return cute.runtime.make_fake_tensor(
         torch2cute[t.dtype],
         (rows, run // V, V),
-        (row_step, V, 1),
-        align=16,
+        stride=(row_step, V, 1),
+        assumed_align=16,
     )
 
 
 def _fake_strided(t, shape):
     # The catch-all route BAKES each operand's layout, which is why the key carries them.
     v = t.expand(shape)
-    return _L.fake_strided(torch2cute[t.dtype], tuple(v.shape), v.stride())
+    return cute.runtime.make_fake_tensor(
+        torch2cute[t.dtype], tuple(v.shape), stride=v.stride()
+    )
 
 
 def _rowvec_ok(inputs, shape, out_dtypes, compute_torch, V):
@@ -763,6 +768,10 @@ def _build_plan(
     # fn a whole V-wide fragment, not one element, so there is no single index to pass), so
     # skip the vec/rowvec tests entirely and let the else-branch below take it.
     vec1 = not with_index and _vec_ok(inputs, shape, out_dtypes, compute_torch, V, ref)
+    if not can_use_32bit_index_math(
+        (*inputs, *seed_outs), shape, block * ept * (V if vec1 else 1)
+    ):
+        raise ValueError("pointwise operands exceed signed 32-bit indexing")
     if vec1 and load != "tma":
         # tma is excluded from the dynamic wrap: make_tiled_tma_atom builds a
         # descriptor from the (static) tile extents; the rare tma plan falls to the
@@ -923,7 +932,9 @@ def run(
         cout = [_view_vec(o, plan.V) for o in outs]
     elif plan.path == "rowvec":
         rows, run, row_step = plan.rowgap
-        cin = [_L.read_only(_view_rowvec(t, rows, run, row_step, plan.V)) for t in inputs]
+        cin = [
+            _L.read_only(_view_rowvec(t, rows, run, row_step, plan.V)) for t in inputs
+        ]
         # outputs are contiguous (row_step == run), whether freshly allocated or a
         # caller-provided .out/in-place tensor the cond verified dense.
         cout = [_view_rowvec(o, rows, run, run, plan.V) for o in outs]
