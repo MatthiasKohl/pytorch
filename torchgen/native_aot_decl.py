@@ -80,7 +80,7 @@ _OPTIONAL_FNS = {
 # instead of matching no declaration and exporting nothing at exit 0. Deliberately
 # WIDER than EXPORTABLE_ARCHES below: an explicit --arch is how a hand run targets
 # something the release wheels do not.
-KNOWN_ARCHES = ("sm_90", "sm_90a", "sm_100", "sm_100a", "sm_103", "sm_103a")
+KNOWN_ARCHES = ("sm_90", "sm_90a", "sm_100", "sm_100a", "sm_103", "sm_103a", "sm_107")
 
 # Which of them the STANDARD build ships: the TORCH_CUDA_ARCH_LIST entries eligible
 # on the automatic export path, which an explicit --arch bypasses. Both spellings of
@@ -90,7 +90,7 @@ KNOWN_ARCHES = ("sm_90", "sm_90a", "sm_100", "sm_100a", "sm_103", "sm_103a")
 # entry also costs another full set of compiled kernels in every wheel naming it, and
 # makes the DSL runtimes mandatory on a builder with that GPU. sm_103 stays out: no
 # arch list we see names 10.3.
-EXPORTABLE_ARCHES = ("sm_90", "sm_90a", "sm_100", "sm_100a")
+EXPORTABLE_ARCHES = ("sm_90", "sm_90a", "sm_100", "sm_100a", "sm_107")
 if not set(EXPORTABLE_ARCHES) <= set(KNOWN_ARCHES):
     raise AssertionError(
         f"EXPORTABLE_ARCHES names arches this tooling cannot target: "

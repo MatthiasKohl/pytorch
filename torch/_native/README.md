@@ -385,3 +385,12 @@ strides greater than one, broadcasting, in-place operations, and unsupported
 layouts or output buffers fall back to ATen. No CuTeDSL vector, conversion,
 fill/range, or RNG kernel is included. The registry scalar-coercion fix is retained
 so calls with Python-number operands can still fall back to ATen correctly.
+
+The initial pointwise AOT declarations export `add`, `sub`, `mul`, `div.Tensor`,
+`neg` and `gt.Tensor` for the exact `sm_107` target. They reuse the TMA executor
+with dynamic sizes and aligned outer pitches for 2-D inputs and dense outputs
+(including transposed outputs allocated by ATen meta). The structured AOT hook
+returns false for contiguous calls, partial tiles, broadcasting, inner strides,
+aliasing outputs and unsupported instantiations, retaining ATen's CUDA kernel.
+No CuTeDSL vectorized or unrolled fallback kernel is registered. Standard AOT
+builds must include `10.7` in `TORCH_CUDA_ARCH_LIST` to export these kernels.
