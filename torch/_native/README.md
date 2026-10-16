@@ -370,3 +370,18 @@ OPINFO_RESTRICT_TO_DSL=triton pytest -sv test/test_binary_ufuncs.py
 ```
 
 This will test all triton-based binary operators.
+
+
+### Pointwise TMA kernels
+
+On Rubin (SM107), pointwise CuTeDSL overrides serve eligible transposed and
+outer-strided CUDA inputs. They use the operation math from PR #191221 with a
+TMA-only executor; fully contiguous calls retain ATen's CUDA vectorized kernels.
+
+The TMA path accepts matching-shape, matching-dtype float16, bfloat16, float32,
+and float64 operands, plus Boolean comparison outputs. It supports aligned row
+pitches and collapsible dimension permutations with complete TMA tiles. Inner
+strides greater than one, broadcasting, in-place operations, and unsupported
+layouts or output buffers fall back to ATen. No CuTeDSL vector, conversion,
+fill/range, or RNG kernel is included. The registry scalar-coercion fix is retained
+so calls with Python-number operands can still fall back to ATen correctly.
