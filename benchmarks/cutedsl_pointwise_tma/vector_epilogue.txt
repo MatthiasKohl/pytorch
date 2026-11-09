@@ -1,0 +1,15 @@
+                for group in cutlass.range_constexpr(self.box * self.box // (self.block * 4)):
+                    index = (tidx + group * self.block) * 4
+                    slow, fast = index // self.box, index % self.box
+                    result = cute.make_rmem_tensor((4,), self.out_type)
+                    for v in cutlass.range_constexpr(4):
+                        values = []
+                        for k in cutlass.range_constexpr(self.ninputs):
+                            if const_expr(self.transposed[k] is None):
+                                values.append(scalars[k])
+                            else:
+                                values.append(self.comp_type(buffers[k][slow, fast + v, stage]))
+                        result[v] = self.out_type(self._apply(values, const0, const1, const2))
+                    offset = cute.crd2idx((batch, slow_base + slow, fast_base + fast), mOut.layout)
+                    target = cute.make_tensor((mOut.iterator + offset).align(16), cute.make_layout(4))
+                    cute.autovec_copy(result, target)

@@ -1,0 +1,6 @@
+/kernel_*.py
+/final-buffers*.json
+/sweep-*.json
+/profile-*
+/*.log
+/__pycache__/

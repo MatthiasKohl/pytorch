@@ -1,0 +1,23 @@
+        if warp_idx == 0:
+            for k in cutlass.range_constexpr(self.ninputs):
+                if const_expr(self.transposed[k] is not None):
+                    cpasync.prefetch_descriptor(tma_inputs[k][0].atom)
+        for stage in cutlass.range_constexpr(_TILES_PER_BLOCK):
+            if warp_idx == const_expr(stage % (self.block // _WARP_SIZE)):
+                if stage < valid_stages:
+                    barrier = barriers + stage
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_init(barrier, 1)
+                        cute.arch.fence_proxy(kind="async.shared", space="cta")
+                    for k in cutlass.range_constexpr(self.ninputs):
+                        if const_expr(self.transposed[k] is not None):
+                            info, tiled = tma_inputs[k]
+                            if const_expr(self.transposed[k]):
+                                tile_coord = (slow_tile, batch * fast_tiles + fast_tile + stage)
+                            else:
+                                tile_coord = (batch * slow_tiles + slow_tile, fast_tile + stage)
+                            g_tile = tiled[((None, None), tile_coord)]
+                            s_tile = buffers[k][None, None, stage]
+                            cutlass.block.block_copy(info.atom, cute.group_modes(g_tile, 0, 2), cute.group_modes(s_tile, 0, 2), tma_bar_ptr=barrier)
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(barrier, tx_bytes)

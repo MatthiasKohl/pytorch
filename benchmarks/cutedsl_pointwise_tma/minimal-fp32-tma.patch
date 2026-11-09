@@ -1,0 +1,28 @@
+diff --git a/torch/_native/ops/pointwise/_limits.py b/torch/_native/ops/pointwise/_limits.py
+--- a/torch/_native/ops/pointwise/_limits.py
++++ b/torch/_native/ops/pointwise/_limits.py
+@@ -12,7 +12,7 @@
+ _TMA_BOX_SIDE = 32
+ _THREADS_PER_BLOCK = 128
+ _ELEMENTS_PER_THREAD = 8
+-_TILES_PER_BLOCK = 6
++_TILES_PER_BLOCK = 2
+ _SMEM_ALIGNMENT = 1024
+ _BARRIER_BYTES = 8
+ _MAX_GRID_YZ = 65535
+diff --git a/torch/_native/ops/pointwise/kernel.py b/torch/_native/ops/pointwise/kernel.py
+--- a/torch/_native/ops/pointwise/kernel.py
++++ b/torch/_native/ops/pointwise/kernel.py
+@@ -92,4 +92,12 @@
+ def _tma_smem_layout(dtype: Any, box: int, transposed: bool) -> Any:
++    if not transposed and dtype.width == 32:
++        # Match the epilogue's stride-one lane axis to avoid shared bank conflicts.
++        layout = cute.make_layout(
++            (box, box, _TILES_PER_BLOCK), stride=(box, 1, box * box)
++        )
++        return cute.make_composed_layout(
++            cute.make_swizzle(0, _SWIZZLE_BASE_LOG2, _SWIZZLE_SHIFT), 0, layout
++        )
+     # Transposed reads need a bank swizzle: 64-byte rows use two XOR bits and
+     # 128-byte rows use three. The lane mapping below complements this swizzle.
+     inner_bytes = box * dtype.width // 8
