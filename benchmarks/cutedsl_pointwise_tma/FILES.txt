@@ -10,6 +10,10 @@ parallel_issue.txt
 profile_suite.py
 published/_layout.py
 published/kernel.py
+reference/blackwell/RESULTS.md
+reference/blackwell/control-candidates.json
+reference/blackwell/finalists-candidates.json
+reference/blackwell/results.json
 reference/rubin/RESULTS.md
 reference/rubin/final-buffers1.json
 reference/rubin/final-buffers4.json

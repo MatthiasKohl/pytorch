@@ -1,0 +1,441 @@
+{
+  "transpose_copy": [
+    {
+      "kind": "tma",
+      "name": "original_tma",
+      "params": [
+        "baseline",
+        6
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "shared_fix_tma",
+      "params": [
+        "rowmajor",
+        2
+      ]
+    },
+    {
+      "kind": "aten",
+      "name": "aten",
+      "params": []
+    },
+    {
+      "kind": "tma",
+      "name": "parallel4_tma",
+      "params": [
+        "parallel",
+        4
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "baseline_s1_box64_b256",
+      "params": [
+        "baseline",
+        1,
+        64,
+        256
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "rect256_s1",
+      "params": [
+        "rect256",
+        1
+      ]
+    },
+    {
+      "kind": "transpose",
+      "name": "classic_ldg_c32_b128",
+      "params": [
+        32,
+        128,
+        false,
+        true
+      ]
+    },
+    {
+      "kind": "transpose",
+      "name": "swizzled_ldgsts_c32_b128",
+      "params": [
+        32,
+        128,
+        true,
+        false
+      ]
+    },
+    {
+      "kind": "triton",
+      "name": "triton_64x64_w8",
+      "params": [
+        64,
+        64,
+        8
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "parallel_s1_box64_b256",
+      "params": [
+        "parallel",
+        1,
+        64,
+        256
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "rect256_s2",
+      "params": [
+        "rect256",
+        2
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "baseline_s2_box64_b512",
+      "params": [
+        "baseline",
+        2,
+        64,
+        512
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "parallel_s2_box64_b512",
+      "params": [
+        "parallel",
+        2,
+        64,
+        512
+      ]
+    }
+  ],
+  "dense_add_host": [
+    {
+      "kind": "tma",
+      "name": "original_tma",
+      "params": [
+        "baseline",
+        6
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "shared_fix_tma",
+      "params": [
+        "rowmajor",
+        2
+      ]
+    },
+    {
+      "kind": "aten",
+      "name": "aten",
+      "params": []
+    },
+    {
+      "kind": "tma",
+      "name": "vector_epilogue_tma",
+      "params": [
+        "rowmajor_vecstore",
+        2
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "rowmajor_s1",
+      "params": [
+        "rowmajor",
+        1
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "rowmajor_vecstore_s1",
+      "params": [
+        "rowmajor_vecstore",
+        1
+      ]
+    },
+    {
+      "kind": "vector",
+      "name": "vec2_ept8_b256",
+      "params": [
+        2,
+        8,
+        256
+      ]
+    },
+    {
+      "kind": "vector",
+      "name": "vec4_ept8_b256",
+      "params": [
+        4,
+        8,
+        256
+      ]
+    },
+    {
+      "kind": "vector",
+      "name": "rubin_vector_unary",
+      "params": [
+        8,
+        32,
+        128
+      ]
+    },
+    {
+      "kind": "triton",
+      "name": "triton_64x32_w8",
+      "params": [
+        64,
+        32,
+        8
+      ]
+    }
+  ],
+  "dense_add_cuda": [
+    {
+      "kind": "tma",
+      "name": "original_tma",
+      "params": [
+        "baseline",
+        6
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "shared_fix_tma",
+      "params": [
+        "rowmajor",
+        2
+      ]
+    },
+    {
+      "kind": "aten",
+      "name": "aten",
+      "params": []
+    },
+    {
+      "kind": "tma",
+      "name": "vector_epilogue_tma",
+      "params": [
+        "rowmajor_vecstore",
+        2
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "rowmajor_s1",
+      "params": [
+        "rowmajor",
+        1
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "rowmajor_vecstore_s1",
+      "params": [
+        "rowmajor_vecstore",
+        1
+      ]
+    },
+    {
+      "kind": "vector",
+      "name": "vec2_ept8_b256",
+      "params": [
+        2,
+        8,
+        256
+      ]
+    },
+    {
+      "kind": "vector",
+      "name": "vec4_ept8_b256",
+      "params": [
+        4,
+        8,
+        256
+      ]
+    },
+    {
+      "kind": "vector",
+      "name": "rubin_vector_unary",
+      "params": [
+        8,
+        32,
+        128
+      ]
+    },
+    {
+      "kind": "triton",
+      "name": "triton_32x64_w8",
+      "params": [
+        32,
+        64,
+        8
+      ]
+    }
+  ],
+  "dense_add_tensor": [
+    {
+      "kind": "tma",
+      "name": "original_tma",
+      "params": [
+        "baseline",
+        6
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "shared_fix_tma",
+      "params": [
+        "rowmajor",
+        2
+      ]
+    },
+    {
+      "kind": "aten",
+      "name": "aten",
+      "params": []
+    },
+    {
+      "kind": "tma",
+      "name": "vector_epilogue_tma",
+      "params": [
+        "rowmajor_vecstore",
+        2
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "rowmajor_s1",
+      "params": [
+        "rowmajor",
+        1
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "rowmajor_vecstore_s1",
+      "params": [
+        "rowmajor_vecstore",
+        1
+      ]
+    },
+    {
+      "kind": "vector",
+      "name": "vec2_ept8_b256",
+      "params": [
+        2,
+        8,
+        256
+      ]
+    },
+    {
+      "kind": "vector",
+      "name": "vec4_ept8_b256",
+      "params": [
+        4,
+        8,
+        256
+      ]
+    },
+    {
+      "kind": "vector",
+      "name": "rubin_vector_binary",
+      "params": [
+        8,
+        16,
+        128
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "rowmajor_s8",
+      "params": [
+        "rowmajor",
+        8
+      ]
+    },
+    {
+      "kind": "triton",
+      "name": "triton_32x64_w8",
+      "params": [
+        32,
+        64,
+        8
+      ]
+    },
+    {
+      "kind": "triton",
+      "name": "triton_32x32_w8",
+      "params": [
+        32,
+        32,
+        8
+      ]
+    }
+  ],
+  "mixed_add": [
+    {
+      "kind": "tma",
+      "name": "original_tma",
+      "params": [
+        "baseline",
+        6
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "shared_fix_tma",
+      "params": [
+        "rowmajor",
+        2
+      ]
+    },
+    {
+      "kind": "aten",
+      "name": "aten",
+      "params": []
+    },
+    {
+      "kind": "tma",
+      "name": "parallel_s4",
+      "params": [
+        "parallel",
+        4
+      ]
+    },
+    {
+      "kind": "tma",
+      "name": "rowmajor_s1",
+      "params": [
+        "rowmajor",
+        1
+      ]
+    },
+    {
+      "kind": "triton",
+      "name": "triton_64x64_w4",
+      "params": [
+        64,
+        64,
+        4
+      ]
+    },
+    {
+      "kind": "triton",
+      "name": "triton_64x64_w8",
+      "params": [
+        64,
+        64,
+        8
+      ]
+    }
+  ]
+}

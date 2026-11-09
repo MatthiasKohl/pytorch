@@ -24,7 +24,9 @@ def main() -> None:
     parser.add_argument("--trials", type=int, default=25)
     parser.add_argument("--cases", nargs="+", choices=bench.CASES)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--candidates", type=Path, help="Per-case tuning candidates; uses the same timing and correctness checks")
     args = parser.parse_args()
+    candidates = json.loads(args.candidates.read_text()) if args.candidates else None
     if args.n < 512 or args.n % 512 != 0 or args.buffers < 1 or args.repeat < args.buffers or args.trials < 3:
         parser.error("n must be a multiple of 512; buffers, repeat and trials must cover all buffers and samples")
     buffers_count, repeat = args.buffers, args.repeat
@@ -66,6 +68,7 @@ def main() -> None:
         "memory_mhz_before": clock_before, "repeat": repeat, "trials": args.trials,
         "torch": torch.__version__, "cuda": torch.version.cuda,
         "cutlass": importlib.metadata.version("nvidia-cutlass-dsl"), "triton": importlib.metadata.version("triton"),
+        "candidates": candidates,
     }
     print(json.dumps({"metadata": metadata}), flush=True)
     baseline = bench.load_snapshot()
@@ -108,9 +111,28 @@ def main() -> None:
             factories["non_tma_cute_ldgsts"] = lambda ins, out: bench.make_cute_transpose(case, ins, out, 128, 128, True, True)
         elif case not in ("mixed_add", "mixed_add_transposed_out"):
             factories["non_tma_cute_vector"] = lambda ins, out: bench.make_cute_vector(baseline, case, ins, out)
+        if candidates is not None:
+            factories = {}
+            for candidate in candidates[case]:
+                kind, params = candidate["kind"], candidate.get("params", [])
+                name = candidate["name"]
+                if kind == "tma":
+                    module = bench.load_snapshot(*params)
+                    factories[name] = lambda ins, out, module=module: bench.make_tma(module, case, ins, out)
+                elif kind == "vector":
+                    factories[name] = lambda ins, out, params=params: bench.make_cute_vector(baseline, case, ins, out, *params)
+                elif kind == "transpose":
+                    factories[name] = lambda ins, out, params=params: bench.make_cute_transpose(case, ins, out, *params)
+                elif kind == "triton":
+                    factories[name] = lambda ins, out, params=params: bench.make_triton(case, ins, out, *params)
+                elif kind == "aten":
+                    factories[name] = lambda ins, out: bench.make_aten(case, ins, out)
+                else:
+                    raise ValueError(f"Unknown candidate kind: {kind}")
         graphs = {}
         keepalive = {}
         for name, factory in factories.items():
+            print(json.dumps({"prepare": name, "case": case}), flush=True)
             group_calls = [[factory(ins, out) for ins, out in group] for group in groups]
             if args.localized:
                 # execute_on_streams forks and joins both halves into the caller.

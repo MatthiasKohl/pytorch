@@ -21,15 +21,30 @@ ROOT = Path(__file__).resolve().parent
 OUTPUT_ROOT = Path(os.environ.get("POINTWISE_PERF_OUTPUT_DIR", str(Path(tempfile.gettempdir()) / "pointwise-tma")))
 
 
-def load_snapshot(variant: str = "baseline", stages: int = 6, box: int = 32) -> Any:
+def load_snapshot(variant: str = "baseline", stages: int = 6, box: int = 32, threads: int = 128, order: str = "native") -> Any:
     import torch._native.ops.pointwise
 
     for name, filename in (("_layout", "_layout.py"), ("_perf_kernel", "kernel.py")):
-        suffix = name if name == "_layout" else f"{name}_{variant}_{stages}_{box}"
+        suffix = name if name == "_layout" else f"{name}_{variant}_{stages}_{box}_{threads}_{order}"
         fullname = f"torch._native.ops.pointwise.{suffix}"
         source_path = ROOT / "published" / filename
-        if name == "_perf_kernel" and (variant != "baseline" or box != 32):
+        if name == "_perf_kernel" and (variant != "baseline" or box != 32 or order != "native"):
             source = source_path.read_text()
+            if order != "native":
+                # Visit input-contiguous tiles first, optionally skewing block rows.
+                source = source.replace(
+                    "fast_group, slow_tile, batch = cute.arch.block_idx()",
+                    "linear, _, batch = cute.arch.block_idx()\n"
+                    "        groups = cute.ceil_div(mOut.shape[2], self.box * _TILES_PER_BLOCK)\n"
+                    "        slow_count = mOut.shape[1] // self.box\n"
+                    "        slow_tile = linear % slow_count\n"
+                    "        fast_group = linear // slow_count\n"
+                    + ("        fast_group = (fast_group + slow_tile) % groups\n" if order == "diagonal" else ""),
+                )
+                source = source.replace(
+                    "cute.ceil_div(cols, self.box * _TILES_PER_BLOCK),\n                cute.ceil_div(rows, self.box),",
+                    "cute.ceil_div(cols, self.box * _TILES_PER_BLOCK) * cute.ceil_div(rows, self.box),\n                1,",
+                )
             if variant == "linear":
                 source = source.replace("self.transposed = config.transposed", "self.transposed = config.transposed\n        self.linear_stores = True not in config.transposed")
                 source = source.replace("if const_expr(self.in_type.width == 32):", "if const_expr(self.linear_stores):\n                        fast = lane\n                        slow = wi\n                    elif const_expr(self.in_type.width == 32):")
@@ -65,13 +80,13 @@ def load_snapshot(variant: str = "baseline", stages: int = 6, box: int = 32) -> 
                 head = head.replace("fast = lane", f"fast = lane + (i % {columns // 32}) * _WARP_SIZE")
                 source = head + "class _ElementwiseScalarVector" + tail
             if box != 32:
-                source = source.replace("warp_iteration = (tidx // _WARP_SIZE) * _ELEMENTS_PER_THREAD", "warp_iteration = (tidx // _WARP_SIZE) * (self.box // 4)")
+                source = source.replace("warp_iteration = (tidx // _WARP_SIZE) * _ELEMENTS_PER_THREAD", "warp_iteration = (tidx // _WARP_SIZE) * (self.box // (self.block // _WARP_SIZE))")
                 source = source.replace("wi = warp_iteration + i", "wi = warp_iteration + i // (self.box // _WARP_SIZE)")
                 source = source.replace("fast = lane", "fast = lane + (i % (self.box // _WARP_SIZE)) * _WARP_SIZE")
             if OUTPUT_ROOT.resolve().is_relative_to(ROOT):
                 raise ValueError("Write generated kernels outside the benchmark package")
             OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-            source_path = OUTPUT_ROOT / f"kernel_{variant}_s{stages}_box{box}.py"
+            source_path = OUTPUT_ROOT / f"kernel_{variant}_s{stages}_box{box}_b{threads}_{order}.py"
             source_path.write_text(source)
         spec = importlib.util.spec_from_file_location(fullname, source_path)
         module = importlib.util.module_from_spec(spec)
@@ -79,7 +94,8 @@ def load_snapshot(variant: str = "baseline", stages: int = 6, box: int = 32) -> 
         spec.loader.exec_module(module)
         module._TILES_PER_BLOCK = stages
         module._TMA_BOX_SIDE = box
-        module._ELEMENTS_PER_THREAD = box * box // 128
+        module._THREADS_PER_BLOCK = threads
+        module._ELEMENTS_PER_THREAD = box * box // threads
         if name == "_perf_kernel" and variant.startswith("rect"):
             module._ELEMENTS_PER_THREAD = 32 * int(variant[4:]) // 128
     return module
@@ -186,6 +202,8 @@ def make_tma(kernel: Any, name: str, ins: list[torch.Tensor], out: torch.Tensor)
     cfg = _tma2d_config(layout, tuple(ins[0].shape), 256 * 1024, out.stride())
     if cfg is None:
         raise ValueError(f"no TMA config for {name}")
+    # The shared selector supplies views; experiments can vary tile and block size.
+    cfg = cfg._replace(box=kernel._TMA_BOX_SIDE, block=kernel._THREADS_PER_BLOCK)
     _, fn = operation(name)
     plan = kernel._compile_plan(fn, name, ins, out, (), cutlass.Float32, cfg)
     runtime_ins = [launch.read_only(t.as_strided(*view)) for t, view in zip(ins, cfg.input_views)]
@@ -214,15 +232,15 @@ def make_cute_transpose(name: str, ins: list[torch.Tensor], out: torch.Tensor, t
     return lambda: compiled(x, target, launch.stream())
 
 
-def make_cute_vector(kernel: Any, name: str, ins: list[torch.Tensor], out: torch.Tensor) -> Callable[[], None]:
+def make_cute_vector(kernel: Any, name: str, ins: list[torch.Tensor], out: torch.Tensor, vec: int = 8, ept: int | None = None, block: int = 128) -> Callable[[], None]:
     from torch._native.ops.pointwise._layout import _TmaConfig
     from torch._native.cutedsl import launch
 
     n = out.numel()
     view = ((n,), (1,))
     count = sum(t.numel() != 1 for t in ins)
-    ept = 32 // count
-    cfg = _TmaConfig(tuple(False if t.numel() != 1 else None for t in ins), 8, 128,
+    ept = 32 // count if ept is None else ept
+    cfg = _TmaConfig(tuple(False if t.numel() != 1 else None for t in ins), vec, block,
                      tuple(view if t.numel() != 1 else ((1,), (1,)) for t in ins), view, ept)
     _, fn = operation(name)
     plan = kernel._compile_plan(fn, name, ins, out, (), cutlass.Float32, cfg)
@@ -295,6 +313,8 @@ def main() -> None:
     parser.add_argument("--variant", default="baseline", choices=("baseline", "linear", "vecstore", "parallel", "rect64", "rect128", "rect256", "rowmajor", "rowmajor_linear", "rowmajor_vecstore"))
     parser.add_argument("--stages", type=int, default=6)
     parser.add_argument("--box", type=int, default=32)
+    parser.add_argument("--tma-threads", type=int, default=128)
+    parser.add_argument("--order", choices=("native", "input", "diagonal"), default="native")
     parser.add_argument("--cute-tile", type=int, default=64)
     parser.add_argument("--cute-threads", type=int, default=128)
     parser.add_argument("--cute-classic", action="store_true")
@@ -304,7 +324,7 @@ def main() -> None:
     from torch import _native
     _native.set_aot_enabled(False)
     torch.manual_seed(123)
-    kernel = load_snapshot(args.variant, args.stages, args.box)
+    kernel = load_snapshot(args.variant, args.stages, args.box, args.tma_threads, args.order)
     rows = []
     for name in args.cases:
         buffers = make_case(name, args.n, args.buffers)
