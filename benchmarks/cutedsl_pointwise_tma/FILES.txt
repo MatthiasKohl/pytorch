@@ -1,4 +1,5 @@
 .gitignore
+FILES.txt
 HANDOFF.md
 bench.py
 cute_transpose.py
@@ -12,7 +13,7 @@ published/kernel.py
 reference/rubin/RESULTS.md
 reference/rubin/final-buffers1.json
 reference/rubin/final-buffers4.json
-reference/rubin/profile-summary.json
+reference/rubin/footprints-4752.json
+reference/rubin/footprints-4752.md
 sweep.py
 vector_epilogue.txt
-FILES.txt

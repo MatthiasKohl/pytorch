@@ -6,7 +6,10 @@ import sys
 
 import bench
 
-root = Path(__file__).resolve().parent
+root = bench.OUTPUT_ROOT
+if root.resolve().is_relative_to(Path(__file__).resolve().parent):
+    raise ValueError("Write sweep output outside the benchmark package")
+root.mkdir(parents=True, exist_ok=True)
 kind = sys.argv[1]
 if kind == "tma":
     settings = [(variant, stages) for variant in ("baseline", "linear") for stages in (2, 4, 6, 8, 12, 16)]

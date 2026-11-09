@@ -4,9 +4,11 @@ import argparse
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 import statistics
 import sys
+import tempfile
 from typing import Any, Callable
 
 import cutlass
@@ -16,6 +18,7 @@ import triton
 import triton.language as tl
 
 ROOT = Path(__file__).resolve().parent
+OUTPUT_ROOT = Path(os.environ.get("POINTWISE_PERF_OUTPUT_DIR", str(Path(tempfile.gettempdir()) / "pointwise-tma")))
 
 
 def load_snapshot(variant: str = "baseline", stages: int = 6, box: int = 32) -> Any:
@@ -65,7 +68,10 @@ def load_snapshot(variant: str = "baseline", stages: int = 6, box: int = 32) -> 
                 source = source.replace("warp_iteration = (tidx // _WARP_SIZE) * _ELEMENTS_PER_THREAD", "warp_iteration = (tidx // _WARP_SIZE) * (self.box // 4)")
                 source = source.replace("wi = warp_iteration + i", "wi = warp_iteration + i // (self.box // _WARP_SIZE)")
                 source = source.replace("fast = lane", "fast = lane + (i % (self.box // _WARP_SIZE)) * _WARP_SIZE")
-            source_path = ROOT / f"kernel_{variant}_s{stages}_box{box}.py"
+            if OUTPUT_ROOT.resolve().is_relative_to(ROOT):
+                raise ValueError("Write generated kernels outside the benchmark package")
+            OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+            source_path = OUTPUT_ROOT / f"kernel_{variant}_s{stages}_box{box}.py"
             source_path.write_text(source)
         spec = importlib.util.spec_from_file_location(fullname, source_path)
         module = importlib.util.module_from_spec(spec)
@@ -126,14 +132,14 @@ def non_tma_flat(X, Y, O, N: tl.constexpr, OP: tl.constexpr, BLOCK: tl.constexpr
     tl.store(O + i, value, i < N)
 
 
-def make_case(name: str, n: int, count: int) -> list[tuple[list[torch.Tensor], torch.Tensor]]:
+def make_case(name: str, n: int, count: int, shape: tuple[int, int] | None = None) -> list[tuple[list[torch.Tensor], torch.Tensor]]:
     results = []
     for _ in range(count):
-        x = torch.randn(n, n, device="cuda", dtype=torch.float32)
+        x = torch.randn(shape or (n, n), device="cuda", dtype=torch.float32)
         if name == "transpose_copy":
-            ins, out = [x], torch.empty_strided((n, n), (1, n), device="cuda")
+            ins, out = [x], torch.empty_strided(x.shape, (1, x.size(0)), device="cuda")
         elif name == "transpose_add_one":
-            ins, out = [x], torch.empty_strided((n, n), (1, n), device="cuda")
+            ins, out = [x], torch.empty_strided(x.shape, (1, x.size(0)), device="cuda")
         elif name == "dense_add_host":
             ins, out = [x], torch.empty_like(x)
         elif name == "dense_add_cuda":
@@ -145,9 +151,11 @@ def make_case(name: str, n: int, count: int) -> list[tuple[list[torch.Tensor], t
         elif name == "transposed_add_cuda":
             ins, out = [x.t(), torch.tensor(1.0, device="cuda")], torch.empty_like(x.t())
         elif name == "mixed_add":
-            ins, out = [x, torch.randn_like(x).t()], torch.empty_like(x)
+            y = torch.randn(x.size(1), x.size(0), device=x.device, dtype=x.dtype).t()
+            ins, out = [x, y], torch.empty_like(x)
         elif name == "mixed_add_transposed_out":
-            ins, out = [x.t(), torch.randn_like(x)], torch.empty_like(x.t())
+            y = torch.randn(x.size(1), x.size(0), device=x.device, dtype=x.dtype)
+            ins, out = [x.t(), y], torch.empty_like(x.t())
         else:
             raise ValueError(name)
         results.append((ins, out))
@@ -198,7 +206,7 @@ def make_cute_transpose(name: str, ins: list[torch.Tensor], out: torch.Tensor, t
     from torch._native.cutedsl import launch
 
     cls = ClassicTranspose if classic else Transpose
-    op = cls(ins[0].size(0), tile, threads, asynchronous, name == "transpose_add_one")
+    op = cls(ins[0].size(1), tile, threads, asynchronous, name == "transpose_add_one", rows=ins[0].size(0))
     fake = launch.fake_compact(cutlass.Float32, (ins[0].numel(),), align=16)
     compiled = launch.compile_kernel(op, fake, fake, launch.stream())
     x = ins[0].view(-1)

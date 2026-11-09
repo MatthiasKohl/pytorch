@@ -10,8 +10,9 @@ from cutlass.cute.nvgpu import cpasync
 
 
 class Transpose:
-    def __init__(self, n: int, tile: int, threads: int, asynchronous: bool, add_one: bool) -> None:
+    def __init__(self, n: int, tile: int, threads: int, asynchronous: bool, add_one: bool, *, rows: int | None = None) -> None:
         self.n = n
+        self.input_rows = n if rows is None else rows
         self.tile = tile
         self.threads = threads
         self.asynchronous = asynchronous
@@ -20,7 +21,7 @@ class Transpose:
     @cute.jit
     def __call__(self, x: cute.Tensor, out: cute.Tensor, stream: cuda.CUstream) -> None:
         self.kernel(x, out).launch(
-            grid=(self.n // self.tile, self.n // self.tile, 1),
+            grid=(self.input_rows // self.tile, self.n // self.tile, 1),
             block=(self.threads, 1, 1), stream=stream,
         )
 
@@ -59,13 +60,14 @@ class Transpose:
                 if const_expr(self.add_one):
                     value += cutlass.Float32(1)
                 result[v] = value
-            target = cute.make_tensor((out.iterator + (bj * self.tile + row) * self.n + bi * self.tile + col).align(16), cute.make_layout(4))
+            target = cute.make_tensor((out.iterator + (bj * self.tile + row) * self.input_rows + bi * self.tile + col).align(16), cute.make_layout(4))
             cute.autovec_copy(result, target)
 
 
 class ClassicTranspose:
-    def __init__(self, n: int, columns: int, threads: int, asynchronous: bool, add_one: bool) -> None:
+    def __init__(self, n: int, columns: int, threads: int, asynchronous: bool, add_one: bool, *, rows: int | None = None) -> None:
         self.n = n
+        self.input_rows = n if rows is None else rows
         self.rows = 32
         self.columns = columns
         self.threads = threads
@@ -74,7 +76,7 @@ class ClassicTranspose:
 
     @cute.jit
     def __call__(self, x: cute.Tensor, out: cute.Tensor, stream: cuda.CUstream) -> None:
-        self.kernel(x, out).launch(grid=(self.n // self.rows, self.n // self.columns, 1), block=(self.threads, 1, 1), stream=stream)
+        self.kernel(x, out).launch(grid=(self.input_rows // self.rows, self.n // self.columns, 1), block=(self.threads, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, x: cute.Tensor, out: cute.Tensor) -> None:
@@ -104,4 +106,4 @@ class ClassicTranspose:
             value = shared[col * (self.columns + 1) + row]
             if const_expr(self.add_one):
                 value += cutlass.Float32(1)
-            out[(bj * self.columns + row) * self.n + bi * self.rows + col] = value
+            out[(bj * self.columns + row) * self.input_rows + bi * self.rows + col] = value
